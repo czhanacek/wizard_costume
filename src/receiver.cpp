@@ -1,6 +1,24 @@
 #include <Arduino.h>
 #include <esp_now.h>
 #include <WiFi.h>
+#include <FastLED.h>
+
+// Debug Configuration
+// Set to 1 to enable demo mode (automatic effect cycling every 3 seconds)
+// Set to 0 to disable demo mode (normal ESP-NOW operation only)
+#define DEBUG_MODE 0
+
+// LED Strip Configuration
+#define LED_PIN 2        // GPIO pin connected to LED strip data line
+#define NUM_LEDS 50      // Number of LEDs to control
+#define LED_TYPE WS2812B // LED strip type (WS2812B)
+#define COLOR_ORDER GRB  // Color order for WS2812B strips (typically GRB)
+
+// Global brightness control (0-255)
+// Adjust this value to change maximum brightness for all effects
+uint8_t globalBrightness = 128;  // Full brightness (adjust as needed)
+
+CRGB leds[NUM_LEDS];
 
 typedef struct {
   int effect_id;
@@ -9,62 +27,63 @@ typedef struct {
 SpellPacket incoming;
 volatile int currentEffect = 0;  // updated in ISR/callback
 
-#define LED_FLASH 4  // onboard flash LED
-
-// LEDC (PWM) configuration
-static const int LEDC_CHANNEL = 0;
-static const int LEDC_TIMER_BITS = 13;
-static const int LEDC_BASE_FREQ = 5000;  // Hz
-static const uint32_t MAX_DUTY = (1u << LEDC_TIMER_BITS) - 1;
-
 // Deferred-work flags/state to keep onRecv minimal and non-blocking
-volatile bool pulseRequested = false;  // used for effect 3 (one-shot pulse)
-volatile bool sawtoothRequested = false;  // used for effect 4 (one-shot sawtooth)
-volatile bool doubleBlinkRequested = false;  // used for effect 5 (one-shot double-blink)
 volatile bool effectUpdated = false;   // for deferred Serial logging
+volatile bool rainbowRequested = false;   // used for effect 1 (one-shot rainbow)
+volatile bool breathRequested = false;    // used for effect 2 (one-shot breathing)
+volatile bool strobeRequested = false;    // used for effect 3 (one-shot strobe)
+volatile bool chaseRequested = false;     // used for effect 5 (one-shot LED chase)
 
 // Effect state
 int lastEffect = -1;
 
-// Breathing effect (effect 1)
-uint32_t breathDuty = 0;
-int32_t breathStep = 64;                 // duty step per tick
-unsigned long nextBreathMs = 0;
-const unsigned long BREATH_INTERVAL_MS = 8;  // update rate
+// One-shot rainbow effect (effect 1)
+bool rainbowActive = false;
+uint8_t rainbowHue = 0;
+uint8_t rainbowCycles = 0;
+const uint8_t RAINBOW_MAX_CYCLES = 3;      // Number of full rainbow cycles
+unsigned long nextRainbowMs = 0;
+const unsigned long RAINBOW_INTERVAL_MS = 20;  // update rate for smooth animation
 
-// Strobe effect (effect 2)
+// One-shot breathing effect (effect 2)
+bool breathActive = false;
+uint8_t breathBrightness = 0;
+int8_t breathStep = 4;                     // brightness step per tick
+uint8_t breathCycles = 0;
+const uint8_t BREATH_MAX_CYCLES = 2;       // Number of breath cycles
+unsigned long nextBreathMs = 0;
+const unsigned long BREATH_INTERVAL_MS = 15;  // update rate
+
+// One-shot strobe effect (effect 3)
+bool strobeActive = false;
 bool strobeOn = false;
+uint8_t strobeFlashes = 0;
+const uint8_t STROBE_MAX_FLASHES = 6;      // Number of flashes
 unsigned long nextStrobeMs = 0;
 const unsigned long STROBE_ON_MS = 60;
 const unsigned long STROBE_OFF_MS = 140;
 
-// One-shot pulse (effect 3) triggered on receive
-bool pulseActive = false;
-bool pulseRising = true;
-uint32_t pulseDuty = 0;
-int32_t pulseStep = 256;                 // duty step per tick
-unsigned long nextPulseMs = 0;
-const unsigned long PULSE_INTERVAL_MS = 4;  // update rate
+// Chase effect (effect 5) - supports multiple simultaneous chasers
+bool chaseActive = false;
+unsigned long nextChaseMs = 0;
+const unsigned long CHASE_INTERVAL_MS = 50; // Speed of chase (milliseconds per LED)
+const int MAX_CHASERS = 10;                // Maximum number of simultaneous chasers
 
-// One-shot sawtooth effect (effect 4) triggered on receive
-bool sawtoothActive = false;
-uint32_t sawDuty = 0;
-uint32_t sawStep = 128;                  // duty step per tick
-unsigned long nextSawMs = 0;
-const unsigned long SAW_INTERVAL_MS = 4; // update rate
+struct Chaser {
+  int position;                            // Current LED position (-1 means inactive)
+  bool active;                             // Whether this chaser is active
+};
 
-// One-shot double-blink effect (effect 5) triggered on receive
-bool doubleBlinkActive = false;
-int dblStep = 0;                         // 0:on, 1:off-short, 2:on, 3:off-long
-unsigned long nextDblMs = 0;
-const unsigned long DBL_ON_MS = 80;
-const unsigned long DBL_OFF_MS = 80;
-const unsigned long DBL_PAUSE_MS = 400;
+Chaser chasers[MAX_CHASERS];
 
-static inline void applyDuty(uint32_t duty) {
-  if (duty > MAX_DUTY) duty = MAX_DUTY;
-  ledcWrite(LEDC_CHANNEL, duty);
-}
+#if DEBUG_MODE
+// Debug mode variables for automatic effect cycling
+int debugEffectIndex = 0;
+unsigned long nextDebugEffectMs = 0;
+const unsigned long DEBUG_EFFECT_DURATION_MS = 1000;  // 1 second per effect
+const int DEBUG_EFFECTS[] = {1, 2, 3, 0};  // Effects to cycle through
+const int DEBUG_EFFECTS_COUNT = sizeof(DEBUG_EFFECTS) / sizeof(DEBUG_EFFECTS[0]);
+#endif
 
 void onRecv(const uint8_t * mac, const uint8_t *incomingData, int len) {
   // Keep callback minimal: parse/copy and set flags only
@@ -72,29 +91,33 @@ void onRecv(const uint8_t * mac, const uint8_t *incomingData, int len) {
     memcpy((void*)&incoming, incomingData, sizeof(incoming));
     currentEffect = incoming.effect_id;
 
+    // Trigger requested one-shot based on effect
+    if (currentEffect == 1) {
+      rainbowRequested = true;
+    } else if (currentEffect == 2) {
+      breathRequested = true;
+    } else if (currentEffect == 3) {
+      strobeRequested = true;
+    } else if (currentEffect == 5) {
+      chaseRequested = true;
+    }
+
     // Signal loop() to do any heavier work
     effectUpdated = true;   // deferred Serial logging
-
-    // For effects 3, 4, 5, each receive triggers a one-shot effect
-    if (currentEffect == 3) {
-      pulseRequested = true;
-    } else if (currentEffect == 4) {
-      sawtoothRequested = true;
-    } else if (currentEffect == 5) {
-      doubleBlinkRequested = true;
-    }
   }
 }
 
 void setup() {
   Serial.begin(115200);
 
-  // Configure LED pin and PWM (LEDC)
-  pinMode(LED_FLASH, OUTPUT);
-  digitalWrite(LED_FLASH, LOW);
-  ledcSetup(LEDC_CHANNEL, LEDC_BASE_FREQ, LEDC_TIMER_BITS);
-  ledcAttachPin(LED_FLASH, LEDC_CHANNEL);
-  applyDuty(0);
+  // Initialize FastLED
+  FastLED.addLeds<LED_TYPE, LED_PIN, COLOR_ORDER>(leds, NUM_LEDS);
+  FastLED.setBrightness(globalBrightness);  // Use global brightness setting
+  FastLED.clear();
+  FastLED.show();
+  Serial.println("WS2812B LED Strip Receiver initialized");
+  Serial.printf("Controlling %d LEDs on pin %d\n", NUM_LEDS, LED_PIN);
+  Serial.printf("Global brightness set to: %d/255\n", globalBrightness);
 
   WiFi.mode(WIFI_STA);
   if (esp_now_init() != ESP_OK) {
@@ -103,6 +126,20 @@ void setup() {
   }
 
   esp_now_register_recv_cb(onRecv);
+  
+#if DEBUG_MODE
+  Serial.println("DEBUG MODE: Automatic effect cycling enabled");
+  Serial.println("Effects will cycle every 1 second: Rainbow -> Breathing -> Strobe -> Off");
+  nextDebugEffectMs = millis() + DEBUG_EFFECT_DURATION_MS;
+  currentEffect = DEBUG_EFFECTS[0];  // Start with first effect
+  if (currentEffect == 1) {
+    rainbowRequested = true;
+  } else if (currentEffect == 2) {
+    breathRequested = true;
+  } else if (currentEffect == 3) {
+    strobeRequested = true;
+  }
+#endif
 }
 
 void loop() {
@@ -120,181 +157,254 @@ void loop() {
     // Reset per-effect state
     switch (currentEffect) {
       case 0: // Off
-        applyDuty(0);
+        FastLED.clear();
+        FastLED.show();
         break;
-      case 1: // Breathing
-        breathDuty = 0;
-        breathStep = abs(breathStep); // start by increasing
+      case 1: // One-shot rainbow trigger
+        rainbowRequested = true;
+        nextRainbowMs = millis();
+        break;
+      case 2: // One-shot breathing trigger
+        breathRequested = true;
         nextBreathMs = millis();
         break;
-      case 2: // Strobe
-        // Start immediately ON so the change is visible right away
-        strobeOn = true;
-        applyDuty(MAX_DUTY);
-        nextStrobeMs = millis() + STROBE_ON_MS;
+      case 3: { // One-shot strobe trigger
+        strobeRequested = true;
+        nextStrobeMs = millis();
         break;
-      case 3: // One-shot pulse on each receive; also start a pulse on entering this mode
-        pulseActive = false;
-        pulseRising = true;
-        pulseDuty = 0;
-        pulseRequested = true; // kick off first pulse immediately
-        nextPulseMs = millis();
-        applyDuty(0);
+      }
+      case 5: { // Multi-chase trigger - initialize chasers array
+        // Initialize all chasers as inactive when entering chase mode
+        for (int i = 0; i < MAX_CHASERS; i++) {
+          chasers[i].active = false;
+          chasers[i].position = -1;
+        }
+        chaseActive = false;
+        chaseRequested = true;
+        nextChaseMs = millis();
         break;
-      case 4: // One-shot sawtooth on each receive
-        sawtoothActive = false;
-        sawDuty = 0;
-        sawtoothRequested = true; // kick off first sawtooth immediately
-        nextSawMs = millis();
-        applyDuty(0);
-        break;
-      case 5: // One-shot double-blink on each receive
-        doubleBlinkActive = false;
-        dblStep = 0;
-        doubleBlinkRequested = true; // kick off first double-blink immediately
-        nextDblMs = millis();
-        applyDuty(0);
-        break;
+      }
       default:
+        // Default to rainbow cycling for unknown effects
+        currentEffect = 1;
+        rainbowHue = 0;
+        nextRainbowMs = millis();
         break;
     }
   }
 
   unsigned long now = millis();
 
+#if DEBUG_MODE
+  // Debug mode: automatically trigger one-shot effects
+  if ((long)(now - nextDebugEffectMs) >= 0) {
+    debugEffectIndex = (debugEffectIndex + 1) % DEBUG_EFFECTS_COUNT;
+    currentEffect = DEBUG_EFFECTS[debugEffectIndex];
+    nextDebugEffectMs = now + DEBUG_EFFECT_DURATION_MS;
+
+    if (currentEffect == 1) {
+      rainbowRequested = true;
+    } else if (currentEffect == 2) {
+      breathRequested = true;
+    } else if (currentEffect == 3) {
+      strobeRequested = true;
+    }
+    
+    const char* effectNames[] = {"Off", "Rainbow", "Breathing", "Strobe"};
+    Serial.printf("DEBUG: Triggering one-shot effect %d (%s)\n", currentEffect, 
+                  currentEffect < 4 ? effectNames[currentEffect] : "Unknown");
+  }
+#endif
+
   // Effect processing (non-blocking state machines)
   switch (currentEffect) {
     case 0: {
-      // Off
+      // Off - LEDs already cleared in effect change
       // Nothing to do
     } break;
 
     case 1: {
-      // Breathing: ramp duty 0..MAX..0 continuously
-      if ((long)(now - nextBreathMs) >= 0) {
-        nextBreathMs = now + BREATH_INTERVAL_MS;
+      // One-shot Rainbow: run a few full hue cycles, then stop
+      if (rainbowRequested) {
+        rainbowRequested = false;
+        rainbowActive = true;
+        rainbowHue = 0;
+        rainbowCycles = 0;
+        nextRainbowMs = now;
+      }
 
-        int32_t d = (int32_t)breathDuty + breathStep;
-        if (d >= (int32_t)MAX_DUTY) {
-          d = MAX_DUTY;
-          breathStep = -breathStep; // start decreasing
-        } else if (d <= 0) {
-          d = 0;
-          breathStep = -breathStep; // start increasing
+      if (rainbowActive && (long)(now - nextRainbowMs) >= 0) {
+        nextRainbowMs = now + RAINBOW_INTERVAL_MS;
+
+        // Create rainbow effect across all LEDs
+        for (int i = 0; i < NUM_LEDS; i++) {
+          uint8_t ledHue = rainbowHue + (i * 256 / NUM_LEDS);
+          leds[i] = CHSV(ledHue, 255, globalBrightness);
         }
-        breathDuty = (uint32_t)d;
-        applyDuty(breathDuty);
+        FastLED.show();
+
+        uint8_t prev = rainbowHue;
+        rainbowHue += 1;  // wraps at 256
+        if (rainbowHue == 0 && prev != 0) {
+          // Completed a full hue cycle
+          rainbowCycles++;
+          if (rainbowCycles >= RAINBOW_MAX_CYCLES) {
+            rainbowActive = false;
+            FastLED.clear();
+            FastLED.show();
+            currentEffect = 0;  // back to off
+          }
+        }
       }
     } break;
 
     case 2: {
-      // Strobe: on/off at fixed intervals
-      if ((long)(now - nextStrobeMs) >= 0) {
-        strobeOn = !strobeOn;
-        applyDuty(strobeOn ? MAX_DUTY : 0);
-        nextStrobeMs = now + (strobeOn ? STROBE_ON_MS : STROBE_OFF_MS);
+      // One-shot Breathing: run a few full breath cycles, then stop
+      if (breathRequested) {
+        breathRequested = false;
+        breathActive = true;
+        breathCycles = 0;
+        breathBrightness = globalBrightness / 10; // start dim
+        breathStep = abs(breathStep);
+        nextBreathMs = now;
+      }
+
+      if (breathActive && (long)(now - nextBreathMs) >= 0) {
+        nextBreathMs = now + BREATH_INTERVAL_MS;
+
+        uint8_t maxBreath = globalBrightness;
+        uint8_t minBreath = globalBrightness / 10;
+
+        // Update brightness with bounds
+        int16_t b = (int16_t)breathBrightness + breathStep;
+        bool hitMax = false;
+        bool hitMin = false;
+        if (b >= maxBreath) {
+          b = maxBreath;
+          breathStep = -breathStep; // start decreasing
+          hitMax = true;
+        } else if (b <= minBreath) {
+          b = minBreath;
+          breathStep = -breathStep; // start increasing
+          hitMin = true;
+        }
+        breathBrightness = (uint8_t)b;
+
+        // Apply rainbow with breathing brightness
+        for (int i = 0; i < NUM_LEDS; i++) {
+          uint8_t ledHue = rainbowHue + (i * 256 / NUM_LEDS);
+          leds[i] = CHSV(ledHue, 255, breathBrightness);
+        }
+        FastLED.show();
+
+        // Step hue slowly for variation
+        rainbowHue += 1;
+
+        // Count a cycle when we bounce off the min
+        if (hitMin) {
+          breathCycles++;
+          if (breathCycles >= BREATH_MAX_CYCLES) {
+            breathActive = false;
+            FastLED.clear();
+            FastLED.show();
+            currentEffect = 0;  // back to off
+          }
+        }
       }
     } break;
 
     case 3: {
-      // One-shot pulse per receive: fade in then fade out once
-      if (pulseRequested) {
-        pulseRequested = false;
-        pulseActive = true;
-        pulseRising = true;
-        pulseDuty = 0;
-        nextPulseMs = now; // start immediately
+      // One-shot Strobe: flash a fixed number of times, then stop
+      if (strobeRequested) {
+        strobeRequested = false;
+        strobeActive = true;
+        strobeOn = false;       // will toggle to ON first tick
+        strobeFlashes = 0;
+        nextStrobeMs = now;
       }
 
-      if (pulseActive && (long)(now - nextPulseMs) >= 0) {
-        nextPulseMs = now + PULSE_INTERVAL_MS;
-
-        if (pulseRising) {
-          int32_t d = (int32_t)pulseDuty + pulseStep;
-          if (d >= (int32_t)MAX_DUTY) {
-            d = MAX_DUTY;
-            pulseRising = false; // begin fading out
-          }
-          pulseDuty = (uint32_t)d;
+      if (strobeActive && (long)(now - nextStrobeMs) >= 0) {
+        strobeOn = !strobeOn;
+        if (strobeOn) {
+          CRGB strobeColor = CRGB::White;
+          strobeColor.nscale8(globalBrightness);
+          fill_solid(leds, NUM_LEDS, strobeColor);
+          nextStrobeMs = now + STROBE_ON_MS;
         } else {
-          int32_t d = (int32_t)pulseDuty - pulseStep;
-          if (d <= 0) {
-            d = 0;
-            pulseActive = false; // finished
+          FastLED.clear();
+          nextStrobeMs = now + STROBE_OFF_MS;
+          strobeFlashes++;
+          if (strobeFlashes >= STROBE_MAX_FLASHES) {
+            strobeActive = false;
+            FastLED.show();
+            currentEffect = 0; // back to off
+            break;
           }
-          pulseDuty = (uint32_t)d;
         }
-
-        applyDuty(pulseDuty);
-      }
-    } break;
-
-    case 4: {
-      // One-shot sawtooth per receive: ramp up to MAX then snap to 0 once
-      if (sawtoothRequested) {
-        sawtoothRequested = false;
-        sawtoothActive = true;
-        sawDuty = 0;
-        nextSawMs = now; // start immediately
-      }
-
-      if (sawtoothActive && (long)(now - nextSawMs) >= 0) {
-        nextSawMs = now + SAW_INTERVAL_MS;
-        uint32_t d = sawDuty + sawStep;
-        if (d >= MAX_DUTY) {
-          // Reached max, snap to 0 and finish
-          sawDuty = 0;
-          applyDuty(0);
-          sawtoothActive = false; // finished
-        } else {
-          sawDuty = d;
-          applyDuty(sawDuty);
-        }
+        FastLED.show();
       }
     } break;
 
     case 5: {
-      // One-shot double-blink per receive: on-off-on-off once
-      if (doubleBlinkRequested) {
-        doubleBlinkRequested = false;
-        doubleBlinkActive = true;
-        dblStep = 0;
-        nextDblMs = now; // start immediately
+      // Multi-Chase: each spell cast fires off a new LED that chases across the strip
+      if (chaseRequested) {
+        chaseRequested = false;
+        
+        // Find an available chaser slot and start a new chase
+        for (int i = 0; i < MAX_CHASERS; i++) {
+          if (!chasers[i].active) {
+            chasers[i].active = true;
+            chasers[i].position = 0;  // Start at beginning of strip
+            chaseActive = true;       // At least one chaser is active
+            nextChaseMs = now;
+            break;
+          }
+        }
       }
 
-      if (doubleBlinkActive && (long)(now - nextDblMs) >= 0) {
-        switch (dblStep) {
-          case 0: // turn on
-            applyDuty(MAX_DUTY);
-            nextDblMs = now + DBL_ON_MS;
-            dblStep = 1;
-            break;
-          case 1: // short off
-            applyDuty(0);
-            nextDblMs = now + DBL_OFF_MS;
-            dblStep = 2;
-            break;
-          case 2: // second on
-            applyDuty(MAX_DUTY);
-            nextDblMs = now + DBL_ON_MS;
-            dblStep = 3;
-            break;
-          case 3: // long pause then finish
-            applyDuty(0);
-            nextDblMs = now + DBL_PAUSE_MS;
-            dblStep = 4;
-            break;
-          case 4: // finished
-            doubleBlinkActive = false;
-            applyDuty(0);
-            break;
+      if (chaseActive && (long)(now - nextChaseMs) >= 0) {
+        nextChaseMs = now + CHASE_INTERVAL_MS;
+
+        // Clear all LEDs first
+        FastLED.clear();
+        
+        bool anyActive = false;
+        
+        // Update and render all active chasers
+        for (int i = 0; i < MAX_CHASERS; i++) {
+          if (chasers[i].active) {
+            // Light up this chaser's current position
+            if (chasers[i].position >= 0 && chasers[i].position < NUM_LEDS) {
+              leds[chasers[i].position] = CRGB::White;
+              leds[chasers[i].position].nscale8(globalBrightness);
+            }
+            
+            // Move to next position
+            chasers[i].position++;
+            
+            // Check if this chaser has completed its journey
+            if (chasers[i].position >= NUM_LEDS) {
+              chasers[i].active = false;  // Deactivate this chaser
+            } else {
+              anyActive = true;  // At least one chaser is still active
+            }
+          }
+        }
+        
+        FastLED.show();
+        
+        // If no chasers are active, turn off chase mode
+        if (!anyActive) {
+          chaseActive = false;
+          // Don't automatically switch to effect 0 - stay in chase mode for next cast
         }
       }
     } break;
 
     default: {
-      // Unknown effect, keep LED off
-      applyDuty(0);
+      // Unknown effect, keep LEDs off
+      FastLED.clear();
+      FastLED.show();
     } break;
   }
 
