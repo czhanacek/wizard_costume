@@ -2,23 +2,74 @@
 #include <esp_now.h>
 #include <WiFi.h>
 #include <FastLED.h>
+#include <ESPmDNS.h>
+#include <WiFiUdp.h>
+#include <ArduinoOTA.h>
+#include <esp_wifi.h>
+
+// OTA Configuration
+// Set your WiFi credentials for OTA updates
+// When OTA is enabled, the device will connect to WiFi for updates
+// Note: ESP-NOW and WiFi station mode can coexist
+#define OTA_ENABLED 1
+#ifndef OTA_HOSTNAME
+#define OTA_HOSTNAME "wizard-receiver"  // Default hostname; override via build_flags
+#endif
+#ifndef OTA_PASSWORD
+#define OTA_PASSWORD ""        // Set via .env -> build_flags; leave blank by default
+#endif
+
+ // WiFi credentials for OTA (only used when OTA_ENABLED is 1)
+ // Provided via build flags from .env (WIFI_SSID / WIFI_PASSWORD)
+#ifndef WIFI_SSID
+#define WIFI_SSID ""
+#endif
+#ifndef WIFI_PASSWORD
+#define WIFI_PASSWORD ""
+#endif
 
 // Debug Configuration
 // Set to 1 to enable demo mode (automatic effect cycling every 3 seconds)
 // Set to 0 to disable demo mode (normal ESP-NOW operation only)
 #define DEBUG_MODE 0
 
+/*
 // LED Strip Configuration
-#define LED_PIN 2        // GPIO pin connected to LED strip data line
-#define NUM_LEDS 50      // Number of LEDs to control
-#define LED_TYPE WS2812B // LED strip type (WS2812B)
-#define COLOR_ORDER GRB  // Color order for WS2812B strips (typically GRB)
+ESP32-CAM (AI Thinker) pin notes:
+- GPIO13/14/15 are SD interface pins. Safe to repurpose for WS2812 data if the SD card is not used.
+- GPIO2 is a boot strap pin (should be HIGH at boot). WS2812 DIN is high-impedance at reset; board has a pull-up, typically OK.
+- GPIO12 is also a strap pin (affects flash voltage). Leave disabled unless necessary; ensure no external pull-up that forces HIGH at boot.
+- GPIO4 controls the onboard flash LED. Using it for a strip disables the flashlight functionality.
+- Avoid GPIO1/3 (UART0) if you need reliable serial logging/programming.
+Electrical guidance:
+- Add a 330–470 Ω series resistor on each data line near the ESP32-CAM.
+- Common ground between ESP32-CAM and all LED power supplies is required.
+- Place a large capacitor (e.g., 1000 µF, >=6.3V) across LED power rails.
+- ESP32 outputs 3.3V; WS2812B often accepts 3.3V data at 5V power, but a 74HCT level shifter is recommended for long runs or reliability.
+*/
+#define NUM_STRIPS 4
+#define LED_PIN_1 13      // Strip A
+#define LED_PIN_2 14      // Strip B
+#define LED_PIN_3 15      // Strip C
+#define LED_PIN_4 2       // Strip D
+// Reserved for future expansion (disabled):
+// #define LED_PIN_5 12    // Use with care (boot strap pin)
+// #define LED_PIN_6 4     // Conflicts with on-board flash LED
+#define NUM_LEDS 50       // LEDs per strip
+#define LED_TYPE WS2812B  // LED strip type (WS2812B)
+#define COLOR_ORDER GRB   // Color order for WS2812B strips (typically GRB)
+// Dynamic ESP-NOW channel (defaults to 1, updated to AP channel if connected during OTA)
+int espnowChannel = 1;
 
 // Global brightness control (0-255)
 // Adjust this value to change maximum brightness for all effects
 uint8_t globalBrightness = 128;  // Full brightness (adjust as needed)
+const uint8_t BRIGHTNESS_STEP = 16; // Step used by spells 7/8
 
-CRGB leds[NUM_LEDS];
+CRGB leds1[NUM_LEDS];
+CRGB leds2[NUM_LEDS];
+CRGB leds3[NUM_LEDS];
+CRGB leds4[NUM_LEDS];
 
 typedef struct {
   int effect_id;
@@ -29,52 +80,56 @@ volatile int currentEffect = 0;  // updated in ISR/callback
 
 // Deferred-work flags/state to keep onRecv minimal and non-blocking
 volatile bool effectUpdated = false;   // for deferred Serial logging
-volatile bool rainbowRequested = false;   // used for effect 1 (one-shot rainbow)
-volatile bool breathRequested = false;    // used for effect 2 (one-shot breathing)
-volatile bool strobeRequested = false;    // used for effect 3 (one-shot strobe)
-volatile bool chaseRequested = false;     // used for effect 5 (one-shot LED chase)
+volatile bool packetFlash = false;        // transient visual pulse on any received packet
+unsigned long packetFlashUntil = 0;
+// Control request flags (set in onRecv, handled in loop)
+volatile bool tempoDownRequested = false;
+volatile bool tempoUpRequested = false;
+volatile bool brightnessDownRequested = false;
+volatile bool brightnessUpRequested = false;
 
 // Effect state
 int lastEffect = -1;
+int backgroundEffect = 0;  // Current background effect (0=off, 1=rainbow, 2=breathing, 3=strobe)
+volatile bool otaInProgress = false;  // Flag to stop effects during OTA
+#if OTA_ENABLED
+const unsigned long OTA_WINDOW_MS = 15000;  // OTA upload window after boot
+bool otaWindowActive = false;
+unsigned long otaWindowEndMs = 0;
+// Visual indicator state during OTA window
+unsigned long otaVisualNextMs = 0;
+const unsigned long OTA_VISUAL_INTERVAL_MS = 30;
+uint8_t otaVisualHue = 160; // blue-ish indicator
+uint8_t otaVisualPos = 0;
+#endif
 
-// One-shot rainbow effect (effect 1)
-bool rainbowActive = false;
+ // Tempo control (applies to all background effects)
+float tempoFactor = 1.0f;        // 1.0 = normal speed
+const float TEMPO_MIN = 0.25f;   // 0.25x (very slow)
+const float TEMPO_MAX = 4.0f;    // 4x (very fast)
+inline unsigned long tempoMs(unsigned long baseMs) {
+  float scaled = baseMs / tempoFactor;
+  if (scaled < 1.0f) scaled = 1.0f;
+  return (unsigned long)scaled;
+}
+
+// Background rainbow effect (effect 1)
 uint8_t rainbowHue = 0;
-uint8_t rainbowCycles = 0;
-const uint8_t RAINBOW_MAX_CYCLES = 3;      // Number of full rainbow cycles
 unsigned long nextRainbowMs = 0;
 const unsigned long RAINBOW_INTERVAL_MS = 20;  // update rate for smooth animation
 
-// One-shot breathing effect (effect 2)
-bool breathActive = false;
+// Background breathing effect (effect 2)
 uint8_t breathBrightness = 0;
 int8_t breathStep = 4;                     // brightness step per tick
-uint8_t breathCycles = 0;
-const uint8_t BREATH_MAX_CYCLES = 2;       // Number of breath cycles
 unsigned long nextBreathMs = 0;
 const unsigned long BREATH_INTERVAL_MS = 15;  // update rate
 
-// One-shot strobe effect (effect 3)
-bool strobeActive = false;
+// Background strobe effect (effect 3)
 bool strobeOn = false;
-uint8_t strobeFlashes = 0;
-const uint8_t STROBE_MAX_FLASHES = 6;      // Number of flashes
 unsigned long nextStrobeMs = 0;
 const unsigned long STROBE_ON_MS = 60;
 const unsigned long STROBE_OFF_MS = 140;
 
-// Chase effect (effect 5) - supports multiple simultaneous chasers
-bool chaseActive = false;
-unsigned long nextChaseMs = 0;
-const unsigned long CHASE_INTERVAL_MS = 50; // Speed of chase (milliseconds per LED)
-const int MAX_CHASERS = 10;                // Maximum number of simultaneous chasers
-
-struct Chaser {
-  int position;                            // Current LED position (-1 means inactive)
-  bool active;                             // Whether this chaser is active
-};
-
-Chaser chasers[MAX_CHASERS];
 
 #if DEBUG_MODE
 // Debug mode variables for automatic effect cycling
@@ -89,37 +144,168 @@ void onRecv(const uint8_t * mac, const uint8_t *incomingData, int len) {
   // Keep callback minimal: parse/copy and set flags only
   if (len >= (int)sizeof(SpellPacket)) {
     memcpy((void*)&incoming, incomingData, sizeof(incoming));
-    currentEffect = incoming.effect_id;
+    int spell = incoming.effect_id;
+    currentEffect = spell; // keep for logging
 
-    // Trigger requested one-shot based on effect
-    if (currentEffect == 1) {
-      rainbowRequested = true;
-    } else if (currentEffect == 2) {
-      breathRequested = true;
-    } else if (currentEffect == 3) {
-      strobeRequested = true;
-    } else if (currentEffect == 5) {
-      chaseRequested = true;
+    // Map spells:
+    // 1-4: set base background effect (4=Off)
+    // 5: tempo down, 6: tempo up, 7: brightness down, 8: brightness up
+    if (spell == 5) {
+      tempoDownRequested = true;
+    } else if (spell == 6) {
+      tempoUpRequested = true;
+    } else if (spell == 7) {
+      brightnessDownRequested = true;
+    } else if (spell == 8) {
+      brightnessUpRequested = true;
     }
 
     // Signal loop() to do any heavier work
     effectUpdated = true;   // deferred Serial logging
+    // Visual pulse to confirm radio reception regardless of effect mapping
+    packetFlash = true;
+    packetFlashUntil = millis() + 120; // ~120ms green blip
   }
+}
+
+static void reinitEspNow() {
+  esp_now_deinit();
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("Error re-initializing ESP-NOW");
+    return;
+  }
+  esp_now_register_recv_cb(onRecv);
+  // Ensure radio channel is explicitly set for ESP-NOW
+  esp_wifi_set_channel((uint8_t)espnowChannel, WIFI_SECOND_CHAN_NONE);
+  Serial.printf("ESP-NOW reinitialized on channel %d\n", WiFi.channel());
 }
 
 void setup() {
   Serial.begin(115200);
 
-  // Initialize FastLED
-  FastLED.addLeds<LED_TYPE, LED_PIN, COLOR_ORDER>(leds, NUM_LEDS);
+  // Initialize FastLED for 4 strips
+  FastLED.addLeds<LED_TYPE, LED_PIN_1, COLOR_ORDER>(leds1, NUM_LEDS);
+  FastLED.addLeds<LED_TYPE, LED_PIN_2, COLOR_ORDER>(leds2, NUM_LEDS);
+  FastLED.addLeds<LED_TYPE, LED_PIN_3, COLOR_ORDER>(leds3, NUM_LEDS);
+  FastLED.addLeds<LED_TYPE, LED_PIN_4, COLOR_ORDER>(leds4, NUM_LEDS);
   FastLED.setBrightness(globalBrightness);  // Use global brightness setting
   FastLED.clear();
   FastLED.show();
   Serial.println("WS2812B LED Strip Receiver initialized");
-  Serial.printf("Controlling %d LEDs on pin %d\n", NUM_LEDS, LED_PIN);
+  Serial.printf("Controlling %d LEDs per strip across %d strips on pins: %d,%d,%d,%d\n", NUM_LEDS, NUM_STRIPS, LED_PIN_1, LED_PIN_2, LED_PIN_3, LED_PIN_4);
   Serial.printf("Global brightness set to: %d/255\n", globalBrightness);
+  // Default to a visible background effect so LEDs show after boot
+  currentEffect = 1;
 
+#if OTA_ENABLED
+  // Connect to WiFi for OTA updates
+  Serial.println("Connecting to WiFi for OTA...");
+  WiFi.mode(WIFI_AP_STA);  // Both AP and Station mode for ESP-NOW + WiFi
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  WiFi.setSleep(false);  // Disable WiFi modem sleep to improve OTA stability
+  
+  // Wait for connection with timeout
+  int wifi_retry = 0;
+  while (WiFi.status() != WL_CONNECTED && wifi_retry < 20) {
+    delay(500);
+    Serial.print(".");
+    wifi_retry++;
+  }
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\nWiFi connected!");
+    Serial.print("IP address: ");
+    Serial.println(WiFi.localIP());
+    Serial.printf("WiFi channel: %d\n", WiFi.channel());
+    // Force ESP-NOW channel to 1 for compatibility with the sender
+    espnowChannel = 1;
+    Serial.printf("ESP-NOW channel forced to %d\n", espnowChannel);
+    
+    // Configure OTA
+    ArduinoOTA.setHostname(OTA_HOSTNAME);
+    ArduinoOTA.setPassword(OTA_PASSWORD);
+    
+    ArduinoOTA.onStart([]() {
+      String type;
+      if (ArduinoOTA.getCommand() == U_FLASH) {
+        type = "sketch";
+      } else {  // U_SPIFFS
+        type = "filesystem";
+      }
+      Serial.println("Start updating " + type);
+      // Stop all effects and turn off LEDs during update
+      otaInProgress = true;
+      backgroundEffect = 0;
+      FastLED.clear();
+      FastLED.show();
+    });
+    
+    ArduinoOTA.onEnd([]() {
+      Serial.println("\nEnd");
+      otaInProgress = false;
+    });
+    
+    ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
+      if (total == 0) {
+        Serial.printf("Progress: %u/%u\r", progress, total);
+        return;
+      }
+      uint32_t pct = (static_cast<uint32_t>(progress) * 100U) / static_cast<uint32_t>(total);
+      static uint32_t lastPct = 101U;
+      if (pct != lastPct) {
+        lastPct = pct;
+        Serial.printf("Progress: %u%%\r", pct);
+      }
+      // LED progress disabled to save memory during OTA
+    });
+    
+    ArduinoOTA.onError([](ota_error_t error) {
+      Serial.printf("Error[%u]: ", error);
+      if (error == OTA_AUTH_ERROR) {
+        Serial.println("Auth Failed");
+      } else if (error == OTA_BEGIN_ERROR) {
+        Serial.println("Begin Failed");
+      } else if (error == OTA_CONNECT_ERROR) {
+        Serial.println("Connect Failed");
+      } else if (error == OTA_RECEIVE_ERROR) {
+        Serial.println("Receive Failed");
+      } else if (error == OTA_END_ERROR) {
+        Serial.println("End Failed");
+      }
+      // Flash red on error
+      fill_solid(leds1, NUM_LEDS, CRGB::Red);
+      fill_solid(leds2, NUM_LEDS, CRGB::Red);
+      fill_solid(leds3, NUM_LEDS, CRGB::Red);
+      fill_solid(leds4, NUM_LEDS, CRGB::Red);
+      FastLED.show();
+      delay(1000);
+      FastLED.clear();
+      FastLED.show();
+      otaInProgress = false;
+    });
+    
+    ArduinoOTA.begin();
+    Serial.println("OTA Ready");
+    Serial.printf("Hostname: %s\n", OTA_HOSTNAME);
+    // Start limited OTA window
+    otaWindowActive = true;
+    otaWindowEndMs = millis() + OTA_WINDOW_MS;
+    Serial.printf("OTA upload window active for %lu ms\n", OTA_WINDOW_MS);
+  } else {
+    Serial.println("\nWiFi connection failed. OTA disabled.");
+    Serial.println("Continuing with ESP-NOW only...");
+    // Pure ESP-NOW STA mode on fixed channel (no SoftAP)
+    WiFi.disconnect(true, true);
+    WiFi.mode(WIFI_STA);
+    delay(100);
+    esp_wifi_set_channel((uint8_t)espnowChannel, WIFI_SECOND_CHAN_NONE);
+    Serial.printf("ESP-NOW only mode on channel %d (STA)\n", espnowChannel);
+    reinitEspNow();
+  }
+#else
   WiFi.mode(WIFI_STA);
+#endif
+
   if (esp_now_init() != ESP_OK) {
     Serial.println("Error initializing ESP-NOW");
     return;
@@ -132,17 +318,53 @@ void setup() {
   Serial.println("Effects will cycle every 1 second: Rainbow -> Breathing -> Strobe -> Off");
   nextDebugEffectMs = millis() + DEBUG_EFFECT_DURATION_MS;
   currentEffect = DEBUG_EFFECTS[0];  // Start with first effect
-  if (currentEffect == 1) {
-    rainbowRequested = true;
-  } else if (currentEffect == 2) {
-    breathRequested = true;
-  } else if (currentEffect == 3) {
-    strobeRequested = true;
-  }
+  backgroundEffect = currentEffect;  // Set initial background effect
 #endif
 }
 
 void loop() {
+#if OTA_ENABLED
+  // During the initial OTA window, handle OTA and show a special LED indicator.
+  if (otaWindowActive) {
+    ArduinoOTA.handle();
+
+    if (!otaInProgress) {
+      unsigned long now = millis();
+      if ((long)(now - otaVisualNextMs) >= 0) {
+        otaVisualNextMs = now + OTA_VISUAL_INTERVAL_MS;
+        // Render a moving blue dot with a small tail to indicate "upload mode"
+        FastLED.clear();
+        leds1[otaVisualPos % NUM_LEDS] = CHSV(otaVisualHue, 200, globalBrightness);
+        if (NUM_LEDS > 1) {
+          leds1[(otaVisualPos + NUM_LEDS - 1) % NUM_LEDS] = CHSV(otaVisualHue, 200, globalBrightness / 4);
+        }
+        otaVisualPos = (otaVisualPos + 1) % NUM_LEDS;
+        FastLED.show();
+      }
+    }
+
+    // Close OTA window after timeout (unless an OTA is currently active)
+    if ((long)(millis() - otaWindowEndMs) >= 0 && !otaInProgress) {
+      otaWindowActive = false;
+      // Switch to pure ESP-NOW STA mode and force channel
+      WiFi.disconnect(true, true);
+      WiFi.mode(WIFI_STA);
+      delay(100);
+      esp_wifi_set_channel((uint8_t)espnowChannel, WIFI_SECOND_CHAN_NONE);
+      reinitEspNow();
+      FastLED.clear();
+      FastLED.show();
+      Serial.printf("OTA window closed; switching to ESP-NOW receiver STA mode on channel %d\n", espnowChannel);
+      Serial.printf("Current channel after switch: %d\n", WiFi.channel());
+    }
+
+    // While in OTA window, skip normal effect rendering
+    if (otaWindowActive) {
+      return;
+    }
+  }
+#endif
+
   // Deferred logging to avoid Serial in callback
   if (effectUpdated) {
     effectUpdated = false;
@@ -150,262 +372,191 @@ void loop() {
     Serial.printf("Received effect %d\n", effect);
   }
 
+  // Handle control requests from spells 5-8
+  if (tempoDownRequested) {
+    tempoDownRequested = false;
+    tempoFactor *= 0.85f; // slow down ~15%
+    if (tempoFactor < TEMPO_MIN) tempoFactor = TEMPO_MIN;
+    Serial.printf("Tempo decreased. tempoFactor=%.2f\n", tempoFactor);
+  }
+  if (tempoUpRequested) {
+    tempoUpRequested = false;
+    tempoFactor *= 1.15f; // speed up ~15%
+    if (tempoFactor > TEMPO_MAX) tempoFactor = TEMPO_MAX;
+    Serial.printf("Tempo increased. tempoFactor=%.2f\n", tempoFactor);
+  }
+  if (brightnessDownRequested) {
+    brightnessDownRequested = false;
+    uint16_t b = globalBrightness;
+    if (b > BRIGHTNESS_STEP) b -= BRIGHTNESS_STEP; else b = 1;
+    globalBrightness = (uint8_t)b;
+    FastLED.setBrightness(globalBrightness);
+    Serial.printf("Brightness decreased to %u/255\n", globalBrightness);
+  }
+  if (brightnessUpRequested) {
+    brightnessUpRequested = false;
+    uint16_t b = globalBrightness;
+    b = (b + BRIGHTNESS_STEP > 255) ? 255 : (b + BRIGHTNESS_STEP);
+    globalBrightness = (uint8_t)b;
+    FastLED.setBrightness(globalBrightness);
+    Serial.printf("Brightness increased to %u/255\n", globalBrightness);
+  }
+
   // Detect effect change and reset state as needed
   if (lastEffect != currentEffect) {
     lastEffect = currentEffect;
 
-    // Reset per-effect state
+    // Reset per-effect state for background effects only
     switch (currentEffect) {
-      case 0: // Off
+      case 0: // Off - clear background effect
+        backgroundEffect = 0;
         FastLED.clear();
         FastLED.show();
         break;
-      case 1: // One-shot rainbow trigger
-        rainbowRequested = true;
-        nextRainbowMs = millis();
-        break;
-      case 2: // One-shot breathing trigger
-        breathRequested = true;
-        nextBreathMs = millis();
-        break;
-      case 3: { // One-shot strobe trigger
-        strobeRequested = true;
-        nextStrobeMs = millis();
-        break;
-      }
-      case 5: { // Multi-chase trigger - initialize chasers array
-        // Initialize all chasers as inactive when entering chase mode
-        for (int i = 0; i < MAX_CHASERS; i++) {
-          chasers[i].active = false;
-          chasers[i].position = -1;
-        }
-        chaseActive = false;
-        chaseRequested = true;
-        nextChaseMs = millis();
-        break;
-      }
-      default:
-        // Default to rainbow cycling for unknown effects
-        currentEffect = 1;
+      case 1: // Background rainbow
+        backgroundEffect = 1;
         rainbowHue = 0;
         nextRainbowMs = millis();
+        break;
+      case 2: // Background breathing
+        backgroundEffect = 2;
+        breathBrightness = globalBrightness / 10;
+        breathStep = abs(breathStep);
+        nextBreathMs = millis();
+        break;
+      case 3: // Background strobe
+        backgroundEffect = 3;
+        strobeOn = false;
+        nextStrobeMs = millis();
+        break;
+      case 4: // Off (spell 4)
+        backgroundEffect = 0;
+        FastLED.clear();
+        FastLED.show();
+        break;
+      default:
+        // Ignore non-background spells (5-8) here
         break;
     }
   }
 
   unsigned long now = millis();
 
+  // Skip all effects if OTA is in progress
+  if (otaInProgress) {
+    return;
+  }
+
 #if DEBUG_MODE
-  // Debug mode: automatically trigger one-shot effects
+  // Debug mode: automatically cycle background effects
   if ((long)(now - nextDebugEffectMs) >= 0) {
     debugEffectIndex = (debugEffectIndex + 1) % DEBUG_EFFECTS_COUNT;
     currentEffect = DEBUG_EFFECTS[debugEffectIndex];
     nextDebugEffectMs = now + DEBUG_EFFECT_DURATION_MS;
-
-    if (currentEffect == 1) {
-      rainbowRequested = true;
-    } else if (currentEffect == 2) {
-      breathRequested = true;
-    } else if (currentEffect == 3) {
-      strobeRequested = true;
-    }
     
     const char* effectNames[] = {"Off", "Rainbow", "Breathing", "Strobe"};
-    Serial.printf("DEBUG: Triggering one-shot effect %d (%s)\n", currentEffect, 
+    Serial.printf("DEBUG: Switching to background effect %d (%s)\n", currentEffect, 
                   currentEffect < 4 ? effectNames[currentEffect] : "Unknown");
   }
 #endif
 
-  // Effect processing (non-blocking state machines)
-  switch (currentEffect) {
+  // First, render background effect (if any)
+  switch (backgroundEffect) {
     case 0: {
-      // Off - LEDs already cleared in effect change
-      // Nothing to do
+      // Off - no background effect
     } break;
 
     case 1: {
-      // One-shot Rainbow: run a few full hue cycles, then stop
-      if (rainbowRequested) {
-        rainbowRequested = false;
-        rainbowActive = true;
-        rainbowHue = 0;
-        rainbowCycles = 0;
-        nextRainbowMs = now;
-      }
-
-      if (rainbowActive && (long)(now - nextRainbowMs) >= 0) {
-        nextRainbowMs = now + RAINBOW_INTERVAL_MS;
+      // Background Rainbow: continuous rainbow cycling
+      if ((long)(now - nextRainbowMs) >= 0) {
+        nextRainbowMs = now + tempoMs(RAINBOW_INTERVAL_MS);
 
         // Create rainbow effect across all LEDs
         for (int i = 0; i < NUM_LEDS; i++) {
           uint8_t ledHue = rainbowHue + (i * 256 / NUM_LEDS);
-          leds[i] = CHSV(ledHue, 255, globalBrightness);
+          leds1[i] = CHSV(ledHue, 255, globalBrightness);
+          leds2[i] = CHSV(ledHue, 255, globalBrightness);
+          leds3[i] = CHSV(ledHue, 255, globalBrightness);
+          leds4[i] = CHSV(ledHue, 255, globalBrightness);
         }
-        FastLED.show();
-
-        uint8_t prev = rainbowHue;
+        
         rainbowHue += 1;  // wraps at 256
-        if (rainbowHue == 0 && prev != 0) {
-          // Completed a full hue cycle
-          rainbowCycles++;
-          if (rainbowCycles >= RAINBOW_MAX_CYCLES) {
-            rainbowActive = false;
-            FastLED.clear();
-            FastLED.show();
-            currentEffect = 0;  // back to off
-          }
-        }
       }
     } break;
 
     case 2: {
-      // One-shot Breathing: run a few full breath cycles, then stop
-      if (breathRequested) {
-        breathRequested = false;
-        breathActive = true;
-        breathCycles = 0;
-        breathBrightness = globalBrightness / 10; // start dim
-        breathStep = abs(breathStep);
-        nextBreathMs = now;
-      }
-
-      if (breathActive && (long)(now - nextBreathMs) >= 0) {
-        nextBreathMs = now + BREATH_INTERVAL_MS;
+      // Background Breathing: continuous breathing effect
+      if ((long)(now - nextBreathMs) >= 0) {
+        nextBreathMs = now + tempoMs(BREATH_INTERVAL_MS);
 
         uint8_t maxBreath = globalBrightness;
         uint8_t minBreath = globalBrightness / 10;
 
         // Update brightness with bounds
         int16_t b = (int16_t)breathBrightness + breathStep;
-        bool hitMax = false;
-        bool hitMin = false;
         if (b >= maxBreath) {
           b = maxBreath;
           breathStep = -breathStep; // start decreasing
-          hitMax = true;
         } else if (b <= minBreath) {
           b = minBreath;
           breathStep = -breathStep; // start increasing
-          hitMin = true;
         }
         breathBrightness = (uint8_t)b;
 
         // Apply rainbow with breathing brightness
         for (int i = 0; i < NUM_LEDS; i++) {
           uint8_t ledHue = rainbowHue + (i * 256 / NUM_LEDS);
-          leds[i] = CHSV(ledHue, 255, breathBrightness);
+          leds1[i] = CHSV(ledHue, 255, breathBrightness);
+          leds2[i] = CHSV(ledHue, 255, breathBrightness);
+          leds3[i] = CHSV(ledHue, 255, breathBrightness);
+          leds4[i] = CHSV(ledHue, 255, breathBrightness);
         }
-        FastLED.show();
 
         // Step hue slowly for variation
         rainbowHue += 1;
-
-        // Count a cycle when we bounce off the min
-        if (hitMin) {
-          breathCycles++;
-          if (breathCycles >= BREATH_MAX_CYCLES) {
-            breathActive = false;
-            FastLED.clear();
-            FastLED.show();
-            currentEffect = 0;  // back to off
-          }
-        }
       }
     } break;
 
     case 3: {
-      // One-shot Strobe: flash a fixed number of times, then stop
-      if (strobeRequested) {
-        strobeRequested = false;
-        strobeActive = true;
-        strobeOn = false;       // will toggle to ON first tick
-        strobeFlashes = 0;
-        nextStrobeMs = now;
-      }
-
-      if (strobeActive && (long)(now - nextStrobeMs) >= 0) {
+      // Background Strobe: continuous strobe effect
+      if ((long)(now - nextStrobeMs) >= 0) {
         strobeOn = !strobeOn;
         if (strobeOn) {
           CRGB strobeColor = CRGB::White;
           strobeColor.nscale8(globalBrightness);
-          fill_solid(leds, NUM_LEDS, strobeColor);
-          nextStrobeMs = now + STROBE_ON_MS;
+          fill_solid(leds1, NUM_LEDS, strobeColor);
+          fill_solid(leds2, NUM_LEDS, strobeColor);
+          fill_solid(leds3, NUM_LEDS, strobeColor);
+          fill_solid(leds4, NUM_LEDS, strobeColor);
+          nextStrobeMs = now + tempoMs(STROBE_ON_MS);
         } else {
           FastLED.clear();
-          nextStrobeMs = now + STROBE_OFF_MS;
-          strobeFlashes++;
-          if (strobeFlashes >= STROBE_MAX_FLASHES) {
-            strobeActive = false;
-            FastLED.show();
-            currentEffect = 0; // back to off
-            break;
-          }
-        }
-        FastLED.show();
-      }
-    } break;
-
-    case 5: {
-      // Multi-Chase: each spell cast fires off a new LED that chases across the strip
-      if (chaseRequested) {
-        chaseRequested = false;
-        
-        // Find an available chaser slot and start a new chase
-        for (int i = 0; i < MAX_CHASERS; i++) {
-          if (!chasers[i].active) {
-            chasers[i].active = true;
-            chasers[i].position = 0;  // Start at beginning of strip
-            chaseActive = true;       // At least one chaser is active
-            nextChaseMs = now;
-            break;
-          }
-        }
-      }
-
-      if (chaseActive && (long)(now - nextChaseMs) >= 0) {
-        nextChaseMs = now + CHASE_INTERVAL_MS;
-
-        // Clear all LEDs first
-        FastLED.clear();
-        
-        bool anyActive = false;
-        
-        // Update and render all active chasers
-        for (int i = 0; i < MAX_CHASERS; i++) {
-          if (chasers[i].active) {
-            // Light up this chaser's current position
-            if (chasers[i].position >= 0 && chasers[i].position < NUM_LEDS) {
-              leds[chasers[i].position] = CRGB::White;
-              leds[chasers[i].position].nscale8(globalBrightness);
-            }
-            
-            // Move to next position
-            chasers[i].position++;
-            
-            // Check if this chaser has completed its journey
-            if (chasers[i].position >= NUM_LEDS) {
-              chasers[i].active = false;  // Deactivate this chaser
-            } else {
-              anyActive = true;  // At least one chaser is still active
-            }
-          }
-        }
-        
-        FastLED.show();
-        
-        // If no chasers are active, turn off chase mode
-        if (!anyActive) {
-          chaseActive = false;
-          // Don't automatically switch to effect 0 - stay in chase mode for next cast
+          nextStrobeMs = now + tempoMs(STROBE_OFF_MS);
         }
       }
     } break;
 
     default: {
-      // Unknown effect, keep LEDs off
-      FastLED.clear();
-      FastLED.show();
+      // Unknown background effect, turn off
+      backgroundEffect = 0;
     } break;
+  }
+
+  // No one-shot effects; ensure LEDs update when only background is active
+  if (currentEffect >= 0 && currentEffect <= 4) {
+    FastLED.show();
+  }
+
+  // Brief green flash on LED 0 to acknowledge any received packet
+  if (!otaWindowActive && !otaInProgress && packetFlash) {
+    if ((long)(millis() - packetFlashUntil) < 0) {
+      // Overlay a green pixel without disturbing the rest much
+      leds1[0] = CRGB::Green;
+      leds1[0].nscale8(globalBrightness);
+      FastLED.show();
+    } else {
+      packetFlash = false;
+    }
   }
 
   // Other non-blocking work can go here
