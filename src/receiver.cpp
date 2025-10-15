@@ -242,6 +242,15 @@ void setup() {
     
     ArduinoOTA.onEnd([]() {
       Serial.println("\nEnd");
+      // Brief green success flash
+      fill_solid(leds1, NUM_LEDS, CRGB::Green);
+      fill_solid(leds2, NUM_LEDS, CRGB::Green);
+      fill_solid(leds3, NUM_LEDS, CRGB::Green);
+      fill_solid(leds4, NUM_LEDS, CRGB::Green);
+      FastLED.show();
+      delay(200);
+      FastLED.clear();
+      FastLED.show();
       otaInProgress = false;
     });
     
@@ -256,7 +265,40 @@ void setup() {
         lastPct = pct;
         Serial.printf("Progress: %u%%\r", pct);
       }
-      // LED progress disabled to save memory during OTA
+
+      // Visual OTA progress across all strips (blue bar fill)
+      // Map progress 0..total to 0..(NUM_LEDS * NUM_STRIPS)
+      const uint32_t totalLeds = (uint32_t)NUM_LEDS * (uint32_t)NUM_STRIPS;
+      uint32_t lit = (total > 0) ? ((uint64_t)progress * totalLeds) / total : 0;
+
+      // Clear all LEDs, then fill lit portion in order: strip1 -> strip4
+      FastLED.clear();
+
+      uint8_t hue = 160; // blue-ish
+      CRGB onColor = CHSV(hue, 255, globalBrightness);
+
+      uint32_t remaining = lit;
+
+      // Strip 1
+      uint32_t c1 = remaining > (uint32_t)NUM_LEDS ? (uint32_t)NUM_LEDS : remaining;
+      if (c1 > 0) fill_solid(leds1, (int)c1, onColor);
+      remaining = (remaining > (uint32_t)NUM_LEDS) ? (remaining - (uint32_t)NUM_LEDS) : 0;
+
+      // Strip 2
+      uint32_t c2 = remaining > (uint32_t)NUM_LEDS ? (uint32_t)NUM_LEDS : remaining;
+      if (c2 > 0) fill_solid(leds2, (int)c2, onColor);
+      remaining = (remaining > (uint32_t)NUM_LEDS) ? (remaining - (uint32_t)NUM_LEDS) : 0;
+
+      // Strip 3
+      uint32_t c3 = remaining > (uint32_t)NUM_LEDS ? (uint32_t)NUM_LEDS : remaining;
+      if (c3 > 0) fill_solid(leds3, (int)c3, onColor);
+      remaining = (remaining > (uint32_t)NUM_LEDS) ? (remaining - (uint32_t)NUM_LEDS) : 0;
+
+      // Strip 4
+      uint32_t c4 = remaining > (uint32_t)NUM_LEDS ? (uint32_t)NUM_LEDS : remaining;
+      if (c4 > 0) fill_solid(leds4, (int)c4, onColor);
+
+      FastLED.show();
     });
     
     ArduinoOTA.onError([](ota_error_t error) {
@@ -332,13 +374,46 @@ void loop() {
       unsigned long now = millis();
       if ((long)(now - otaVisualNextMs) >= 0) {
         otaVisualNextMs = now + OTA_VISUAL_INTERVAL_MS;
-        // Render a moving blue dot with a small tail to indicate "upload mode"
+        // Render a colorful comet animation across all strips to indicate "upload mode"
         FastLED.clear();
-        leds1[otaVisualPos % NUM_LEDS] = CHSV(otaVisualHue, 200, globalBrightness);
+
+        uint8_t hue0 = otaVisualHue;
+        uint8_t hue1 = otaVisualHue + 42;
+        uint8_t hue2 = otaVisualHue + 84;
+        uint8_t hue3 = otaVisualHue + 126;
+
+        int head = otaVisualPos % NUM_LEDS;
+
+        // Strip 1
+        leds1[head] = CHSV(hue0, 220, globalBrightness);
         if (NUM_LEDS > 1) {
-          leds1[(otaVisualPos + NUM_LEDS - 1) % NUM_LEDS] = CHSV(otaVisualHue, 200, globalBrightness / 4);
+          int t1 = (head + NUM_LEDS - 1) % NUM_LEDS;
+          leds1[t1] = CHSV(hue0, 220, globalBrightness / 4);
         }
+
+        // Strip 2
+        leds2[head] = CHSV(hue1, 220, globalBrightness);
+        if (NUM_LEDS > 1) {
+          int t2 = (head + NUM_LEDS - 1) % NUM_LEDS;
+          leds2[t2] = CHSV(hue1, 220, globalBrightness / 4);
+        }
+
+        // Strip 3
+        leds3[head] = CHSV(hue2, 220, globalBrightness);
+        if (NUM_LEDS > 1) {
+          int t3 = (head + NUM_LEDS - 1) % NUM_LEDS;
+          leds3[t3] = CHSV(hue2, 220, globalBrightness / 4);
+        }
+
+        // Strip 4
+        leds4[head] = CHSV(hue3, 220, globalBrightness);
+        if (NUM_LEDS > 1) {
+          int t4 = (head + NUM_LEDS - 1) % NUM_LEDS;
+          leds4[t4] = CHSV(hue3, 220, globalBrightness / 4);
+        }
+
         otaVisualPos = (otaVisualPos + 1) % NUM_LEDS;
+        otaVisualHue++; // slowly cycle hues for a prettier effect
         FastLED.show();
       }
     }
