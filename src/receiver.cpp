@@ -55,6 +55,15 @@ Electrical guidance:
 // Reserved for future expansion (disabled):
 // #define LED_PIN_5 12    // Use with care (boot strap pin)
 // #define LED_PIN_6 4     // Conflicts with on-board flash LED
+
+// Stole strand (demo)
+#ifndef LED_PIN_STOLE
+#define LED_PIN_STOLE 4   // GPIO4 shares the on-board flash LED; acceptable tradeoff for wearable
+#endif
+#ifndef NUM_LEDS_STOLE
+#define NUM_LEDS_STOLE 250
+#endif
+
 #define NUM_LEDS 50       // LEDs per strip
 #define LED_TYPE WS2812B  // LED strip type (WS2812B)
 #define COLOR_ORDER GRB   // Color order for WS2812B strips (typically GRB)
@@ -70,6 +79,7 @@ CRGB leds1[NUM_LEDS];
 CRGB leds2[NUM_LEDS];
 CRGB leds3[NUM_LEDS];
 CRGB leds4[NUM_LEDS];
+CRGB ledsStole[NUM_LEDS_STOLE];
 
 typedef struct {
   int effect_id;
@@ -183,16 +193,18 @@ static void reinitEspNow() {
 void setup() {
   Serial.begin(115200);
 
-  // Initialize FastLED for 4 strips
+  // Initialize FastLED for 4 strips + stole
   FastLED.addLeds<LED_TYPE, LED_PIN_1, COLOR_ORDER>(leds1, NUM_LEDS);
   FastLED.addLeds<LED_TYPE, LED_PIN_2, COLOR_ORDER>(leds2, NUM_LEDS);
   FastLED.addLeds<LED_TYPE, LED_PIN_3, COLOR_ORDER>(leds3, NUM_LEDS);
   FastLED.addLeds<LED_TYPE, LED_PIN_4, COLOR_ORDER>(leds4, NUM_LEDS);
+  FastLED.addLeds<LED_TYPE, LED_PIN_STOLE, COLOR_ORDER>(ledsStole, NUM_LEDS_STOLE);
   FastLED.setBrightness(globalBrightness);  // Use global brightness setting
   FastLED.clear();
   FastLED.show();
   Serial.println("WS2812B LED Strip Receiver initialized");
   Serial.printf("Controlling %d LEDs per strip across %d strips on pins: %d,%d,%d,%d\n", NUM_LEDS, NUM_STRIPS, LED_PIN_1, LED_PIN_2, LED_PIN_3, LED_PIN_4);
+  Serial.printf("Stole strand: %d LEDs on pin %d\n", NUM_LEDS_STOLE, LED_PIN_STOLE);
   Serial.printf("Global brightness set to: %d/255\n", globalBrightness);
   // Default to a visible background effect so LEDs show after boot
   currentEffect = 1;
@@ -247,6 +259,7 @@ void setup() {
       fill_solid(leds2, NUM_LEDS, CRGB::Green);
       fill_solid(leds3, NUM_LEDS, CRGB::Green);
       fill_solid(leds4, NUM_LEDS, CRGB::Green);
+      fill_solid(ledsStole, NUM_LEDS_STOLE, CRGB::Green);
       FastLED.show();
       delay(200);
       FastLED.clear();
@@ -319,6 +332,7 @@ void setup() {
       fill_solid(leds2, NUM_LEDS, CRGB::Red);
       fill_solid(leds3, NUM_LEDS, CRGB::Red);
       fill_solid(leds4, NUM_LEDS, CRGB::Red);
+      fill_solid(ledsStole, NUM_LEDS_STOLE, CRGB::Red);
       FastLED.show();
       delay(1000);
       FastLED.clear();
@@ -554,7 +568,12 @@ void loop() {
           leds3[i] = CHSV(ledHue, 255, globalBrightness);
           leds4[i] = CHSV(ledHue, 255, globalBrightness);
         }
-        
+        // Stole strand (scaled to its length)
+        for (int j = 0; j < NUM_LEDS_STOLE; j++) {
+          uint8_t ledHue2 = rainbowHue + (j * 256 / NUM_LEDS_STOLE);
+          ledsStole[j] = CHSV(ledHue2, 255, globalBrightness);
+        }
+
         rainbowHue += 1;  // wraps at 256
       }
     } break;
@@ -586,6 +605,11 @@ void loop() {
           leds3[i] = CHSV(ledHue, 255, breathBrightness);
           leds4[i] = CHSV(ledHue, 255, breathBrightness);
         }
+        // Stole strand (scaled to its length)
+        for (int j = 0; j < NUM_LEDS_STOLE; j++) {
+          uint8_t ledHue2 = rainbowHue + (j * 256 / NUM_LEDS_STOLE);
+          ledsStole[j] = CHSV(ledHue2, 255, breathBrightness);
+        }
 
         // Step hue slowly for variation
         rainbowHue += 1;
@@ -603,6 +627,7 @@ void loop() {
           fill_solid(leds2, NUM_LEDS, strobeColor);
           fill_solid(leds3, NUM_LEDS, strobeColor);
           fill_solid(leds4, NUM_LEDS, strobeColor);
+          fill_solid(ledsStole, NUM_LEDS_STOLE, strobeColor);
           nextStrobeMs = now + tempoMs(STROBE_ON_MS);
         } else {
           FastLED.clear();
