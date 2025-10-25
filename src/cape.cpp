@@ -6,6 +6,71 @@
 #include <WiFiUdp.h>
 #include <ArduinoOTA.h>
 #include <esp_wifi.h>
+#include <stdarg.h>
+
+#ifndef DEBUG_NET_SERIAL
+#define DEBUG_NET_SERIAL 1
+#endif
+
+#if DEBUG_NET_SERIAL
+WiFiServer debugServer(23);
+WiFiClient debugClient;
+unsigned long nextTouchLogMs = 0;
+
+static void debugBegin() {
+  debugServer.begin();
+  debugServer.setNoDelay(true);
+}
+
+static void debugAcceptClient() {
+  if (!debugClient || !debugClient.connected()) {
+    WiFiClient n = debugServer.available();
+    if (n) {
+      if (debugClient) debugClient.stop();
+      debugClient = n;
+      debugClient.setNoDelay(true);
+      Serial.println("NetSerial: client connected");
+    }
+  }
+}
+
+static void debugPrint(const char* s) {
+  if (debugClient && debugClient.connected()) debugClient.print(s);
+}
+
+static void debugPrintln(const char* s) {
+  if (debugClient && debugClient.connected()) {
+    debugClient.print(s);
+    debugClient.print("\r\n");
+  }
+}
+
+static void debugPrintf(const char* fmt, ...) {
+  if (!(debugClient && debugClient.connected())) return;
+  char buf[256];
+  va_list ap;
+  va_start(ap, fmt);
+  vsnprintf(buf, sizeof(buf), fmt, ap);
+  va_end(ap);
+  debugClient.print(buf);
+}
+
+static void logBoth(const char* s) { Serial.print(s); debugPrint(s); }
+static void logBothLn(const char* s) { Serial.println(s); debugPrintln(s); }
+static void logBothF(const char* fmt, ...) {
+  char buf[256];
+  va_list ap;
+  va_start(ap, fmt);
+  vsnprintf(buf, sizeof(buf), fmt, ap);
+  va_end(ap);
+  Serial.print(buf);
+  if (debugClient && debugClient.connected()) debugClient.print(buf);
+}
+#endif
+
+#if DEBUG_NET_SERIAL
+bool debugActive = false;
+#endif
 
 // OTA Configuration
 // Set your WiFi credentials for OTA updates
@@ -13,7 +78,7 @@
 // Note: ESP-NOW and WiFi station mode can coexist
 #define OTA_ENABLED 1
 #ifndef OTA_HOSTNAME
-#define OTA_HOSTNAME "wizard-receiver"  // Default hostname; override via build_flags
+#define OTA_HOSTNAME "wizard-cape"  // Default hostname; override via build_flags
 #endif
 #ifndef OTA_PASSWORD
 #define OTA_PASSWORD ""        // Set via .env -> build_flags; leave blank by default
@@ -56,9 +121,11 @@ Electrical guidance:
 // #define LED_PIN_5 12    // Use with care (boot strap pin)
 // #define LED_PIN_6 4     // Conflicts with on-board flash LED
 
-// Stole strand (demo)
+// Hat strand (connected to cape)
+// GPIO12 is a boot strap pin but safe for LED data after boot
+// Alternative: GPIO16 if GPIO12 causes issues
 #ifndef LED_PIN_STOLE
-#define LED_PIN_STOLE 4   // GPIO4 shares the on-board flash LED; acceptable tradeoff for wearable
+#define LED_PIN_STOLE 12   // GPIO12 - Hat LEDs (250 LEDs)
 #endif
 #ifndef NUM_LEDS_STOLE
 #define NUM_LEDS_STOLE 250
@@ -199,29 +266,21 @@ static void reinitEspNow() {
   }
   esp_now_register_recv_cb(onRecv);
   // Ensure radio channel is explicitly set for ESP-NOW
-  esp_wifi_set_channel((uint8_t)espnowChannel, WIFI_SECOND_CHAN_NONE);
+  uint8_t ch = (WiFi.status() == WL_CONNECTED) ? (uint8_t)WiFi.channel() : (uint8_t)espnowChannel;
+  esp_wifi_set_channel(ch, WIFI_SECOND_CHAN_NONE);
+  espnowChannel = ch;
   Serial.printf("ESP-NOW reinitialized on channel %d\n", WiFi.channel());
 }
 
 void setup() {
   Serial.begin(115200);
-  // Setup built-in LED PWM if not conflicting with a used data pin
-#if defined(BUILTIN_LED_PIN)
-  // If LED_PIN_STOLE shares GPIO4, skip to avoid contention
-  #if defined(LED_PIN_STOLE)
-  if (BUILTIN_LED_PIN != LED_PIN_STOLE) {
-    ledcSetup(LEDC_CHANNEL_BUILTIN, LEDC_FREQ_HZ, LEDC_TIMER_BITS);
-    ledcAttachPin(BUILTIN_LED_PIN, LEDC_CHANNEL_BUILTIN);
-    ledcWrite(LEDC_CHANNEL_BUILTIN, 0);
-    builtinLedReady = true;
-  }
-  #else
-  ledcSetup(LEDC_CHANNEL_BUILTIN, LEDC_FREQ_HZ, LEDC_TIMER_BITS);
-  ledcAttachPin(BUILTIN_LED_PIN, LEDC_CHANNEL_BUILTIN);
-  ledcWrite(LEDC_CHANNEL_BUILTIN, 0);
-  builtinLedReady = true;
-  #endif
+  delay(50);
+  Serial.println("WS2812B LED Strip Cape (with NetSerial)");
+#if DEBUG_NET_SERIAL
+  Serial.println("NetSerial: will start after OTA window (post-OTA).");
 #endif
+  // Built-in LED (GPIO4) not used - hat LEDs on GPIO12 instead
+  builtinLedReady = false;
 
   // Initialize FastLED for 4 strips + stole
   FastLED.addLeds<LED_TYPE, LED_PIN_1, COLOR_ORDER>(leds1, NUM_LEDS);
@@ -232,19 +291,31 @@ void setup() {
   FastLED.setBrightness(globalBrightness);  // Use global brightness setting
   FastLED.clear();
   FastLED.show();
-  Serial.println("WS2812B LED Strip Receiver initialized");
-  Serial.printf("Controlling %d LEDs per strip across %d strips on pins: %d,%d,%d,%d\n", NUM_LEDS, NUM_STRIPS, LED_PIN_1, LED_PIN_2, LED_PIN_3, LED_PIN_4);
-  Serial.printf("Stole strand: %d LEDs on pin %d\n", NUM_LEDS_STOLE, LED_PIN_STOLE);
-  Serial.printf("Global brightness set to: %d/255\n", globalBrightness);
+  logBothLn("WS2812B LED Strip Cape initialized");
+  logBothF("Controlling %d LEDs per strip across %d strips on pins: %d,%d,%d,%d\n", NUM_LEDS, NUM_STRIPS, LED_PIN_1, LED_PIN_2, LED_PIN_3, LED_PIN_4);
+  logBothF("Stole strand: %d LEDs on pin %d\n", NUM_LEDS_STOLE, LED_PIN_STOLE);
+  logBothF("Global brightness set to: %d/255\n", globalBrightness);
   // Default to a visible background effect so LEDs show after boot
   currentEffect = 1;
+
+  // WiFi/ESP-NOW: Start with SoftAP FIRST to pin channel (CRITICAL - must be before esp_now_init)
+  WiFi.mode(WIFI_AP_STA);
+  WiFi.setSleep(false);
+  WiFi.softAP("cape-sync", "", espnowChannel, 1 /* hidden */);
+  delay(100);
+  
+  // Initialize ESP-NOW AFTER SoftAP is created
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("Error initializing ESP-NOW");
+    return;
+  }
+  esp_now_register_recv_cb(onRecv);
+  Serial.printf("ESP-NOW initialized on channel %d\n", espnowChannel);
 
 #if OTA_ENABLED
   // Connect to WiFi for OTA updates
   Serial.println("Connecting to WiFi for OTA...");
-  WiFi.mode(WIFI_AP_STA);  // Both AP and Station mode for ESP-NOW + WiFi
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  WiFi.setSleep(false);  // Disable WiFi modem sleep to improve OTA stability
   
   // Wait for connection with timeout
   int wifi_retry = 0;
@@ -259,9 +330,6 @@ void setup() {
     Serial.print("IP address: ");
     Serial.println(WiFi.localIP());
     Serial.printf("WiFi channel: %d\n", WiFi.channel());
-    // Force ESP-NOW channel to 1 for compatibility with the sender
-    espnowChannel = 1;
-    Serial.printf("ESP-NOW channel forced to %d\n", espnowChannel);
     
     // Configure OTA
     ArduinoOTA.setHostname(OTA_HOSTNAME);
@@ -295,6 +363,13 @@ void setup() {
       FastLED.clear();
       FastLED.show();
       otaInProgress = false;
+#if DEBUG_NET_SERIAL
+      if (!debugActive) {
+        debugBegin();
+        debugActive = true;
+        Serial.println("NetSerial: started on TCP port 23 (post-OTA end)");
+      }
+#endif
     });
     
     ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
@@ -379,25 +454,11 @@ void setup() {
     Serial.printf("OTA upload window active for %lu ms\n", OTA_WINDOW_MS);
   } else {
     Serial.println("\nWiFi connection failed. OTA disabled.");
-    Serial.println("Continuing with ESP-NOW only...");
-    // Pure ESP-NOW STA mode on fixed channel (no SoftAP)
-    WiFi.disconnect(true, true);
-    WiFi.mode(WIFI_STA);
-    delay(100);
-    esp_wifi_set_channel((uint8_t)espnowChannel, WIFI_SECOND_CHAN_NONE);
-    Serial.printf("ESP-NOW only mode on channel %d (STA)\n", espnowChannel);
-    reinitEspNow();
+    Serial.println("Continuing with ESP-NOW only (already initialized)...");
   }
 #else
-  WiFi.mode(WIFI_STA);
+  Serial.println("OTA disabled in build config");
 #endif
-
-  if (esp_now_init() != ESP_OK) {
-    Serial.println("Error initializing ESP-NOW");
-    return;
-  }
-
-  esp_now_register_recv_cb(onRecv);
   
 #if DEBUG_MODE
   Serial.println("DEBUG MODE: Automatic effect cycling enabled");
@@ -409,6 +470,9 @@ void setup() {
 }
 
 void loop() {
+#if DEBUG_NET_SERIAL
+  if (debugActive) debugAcceptClient();
+#endif
 #if OTA_ENABLED
   // During the initial OTA window, handle OTA and show a special LED indicator.
   if (otaWindowActive) {
@@ -475,11 +539,19 @@ void loop() {
     // Close OTA window after timeout (unless an OTA is currently active)
     if ((long)(millis() - otaWindowEndMs) >= 0 && !otaInProgress) {
       otaWindowActive = false;
-      // Switch to pure ESP-NOW STA mode and force channel
-      WiFi.disconnect(true, true);
-      WiFi.mode(WIFI_STA);
-      delay(100);
-      esp_wifi_set_channel((uint8_t)espnowChannel, WIFI_SECOND_CHAN_NONE);
+      // Prepare ESP-NOW mode. If STA is connected, keep it and adopt its channel.
+      if (WiFi.status() == WL_CONNECTED) {
+        WiFi.mode(WIFI_AP_STA);
+        uint8_t chNow = (uint8_t)WiFi.channel();
+        WiFi.softAP("cape-sync", "", chNow, 1 /* hidden */);
+        delay(100);
+        espnowChannel = chNow;
+      } else {
+        WiFi.disconnect(true, true);
+        WiFi.mode(WIFI_AP_STA);
+        WiFi.softAP("cape-sync", "", espnowChannel, 1 /* hidden */);
+        delay(100);
+      }
       reinitEspNow();
       FastLED.clear();
       FastLED.show();
@@ -487,8 +559,15 @@ void loop() {
       if (builtinLedReady) {
         ledcWrite(LEDC_CHANNEL_BUILTIN, 0);
       }
-      Serial.printf("OTA window closed; switching to ESP-NOW receiver STA mode on channel %d\n", espnowChannel);
-      Serial.printf("Current channel after switch: %d\n", WiFi.channel());
+      logBothF("OTA window closed; switching to ESP-NOW receiver mode on channel %d\n", espnowChannel);
+      logBothF("Current channel after switch: %d\n", WiFi.channel());
+#if DEBUG_NET_SERIAL
+      if (!debugActive) {
+        debugBegin();
+        debugActive = true;
+        Serial.println("NetSerial: started on TCP port 23 (post-OTA)");
+      }
+#endif
     }
 
     // While in OTA window, skip normal effect rendering
@@ -502,7 +581,7 @@ void loop() {
   if (effectUpdated) {
     effectUpdated = false;
     int effect = currentEffect; // read once
-    Serial.printf("Received effect %d\n", effect);
+    logBothF("Received effect %d\n", effect);
   }
 
   // Handle control requests from spells 5-8
@@ -510,13 +589,13 @@ void loop() {
     tempoDownRequested = false;
     tempoFactor *= 0.85f; // slow down ~15%
     if (tempoFactor < TEMPO_MIN) tempoFactor = TEMPO_MIN;
-    Serial.printf("Tempo decreased. tempoFactor=%.2f\n", tempoFactor);
+    logBothF("Tempo decreased. tempoFactor=%.2f\n", tempoFactor);
   }
   if (tempoUpRequested) {
     tempoUpRequested = false;
     tempoFactor *= 1.15f; // speed up ~15%
     if (tempoFactor > TEMPO_MAX) tempoFactor = TEMPO_MAX;
-    Serial.printf("Tempo increased. tempoFactor=%.2f\n", tempoFactor);
+    logBothF("Tempo increased. tempoFactor=%.2f\n", tempoFactor);
   }
   if (brightnessDownRequested) {
     brightnessDownRequested = false;
@@ -524,7 +603,7 @@ void loop() {
     if (b > BRIGHTNESS_STEP) b -= BRIGHTNESS_STEP; else b = 1;
     globalBrightness = (uint8_t)b;
     FastLED.setBrightness(globalBrightness);
-    Serial.printf("Brightness decreased to %u/255\n", globalBrightness);
+    logBothF("Brightness decreased to %u/255\n", globalBrightness);
   }
   if (brightnessUpRequested) {
     brightnessUpRequested = false;
@@ -532,7 +611,7 @@ void loop() {
     b = (b + BRIGHTNESS_STEP > 255) ? 255 : (b + BRIGHTNESS_STEP);
     globalBrightness = (uint8_t)b;
     FastLED.setBrightness(globalBrightness);
-    Serial.printf("Brightness increased to %u/255\n", globalBrightness);
+    logBothF("Brightness increased to %u/255\n", globalBrightness);
   }
 
   // Detect effect change and reset state as needed
@@ -675,9 +754,12 @@ void loop() {
   // Brief green flash on LED 0 to acknowledge any received packet
   if (!otaWindowActive && !otaInProgress && packetFlash) {
     if ((long)(millis() - packetFlashUntil) < 0) {
-      // Overlay a green pixel without disturbing the rest much
+      // Overlay a bright green pixel on ALL strips to make it very visible
       leds1[0] = CRGB::Green;
-      leds1[0].nscale8(globalBrightness);
+      leds2[0] = CRGB::Green;
+      leds3[0] = CRGB::Green;
+      leds4[0] = CRGB::Green;
+      ledsStole[0] = CRGB::Green;
       FastLED.show();
     } else {
       packetFlash = false;
