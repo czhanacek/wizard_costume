@@ -1,101 +1,46 @@
 # Staff 2-Button Spell UI Guide
 
 ## Overview
-The staff now features an intuitive 2-button interface for casting spells to the hat. The UI uses **mode switching** to organize spell casting into three logical categories.
+The staff features an intuitive 2-button interface with **hold/tap combo detection** for casting spells. Single taps trigger basic actions, while holding one button and tapping the other enables advanced brightness control.
 
 ## Hardware
-- **Button 1 (Pad 0)**: GPIO12 - Left touch pad
-- **Button 2 (Pad 1)**: GPIO14 - Right touch pad
-- **Both Buttons**: Hold simultaneously for 3+ seconds to reset
+- **Top Button (Pad 0)**: GPIO12 - Top touch pad
+- **Bottom Button (Pad 1)**: GPIO14 - Bottom touch pad
+- **Hold Threshold**: 300ms to register as "hold"
+- **Both-Hold Threshold**: 400ms for both-hold action
 
-## UI Modes
+## Control Methods
 
-### Mode 1: EFFECTS (Default)
-**Purpose**: Cycle through visual effects on the hat
+### Single Tap Actions
+**Tap Top Button**: Cycle Effects
+- Rainbow → Breathing → Off → Rainbow...
+- Sends spell 1, 2, or 3
 
-**Button 1 Action**: Cycle to next effect
-- Rainbow → Breathing → Strobe → Off → Rainbow...
-
-**Button 2 Action**: Switch to BRIGHTNESS mode
-
-**LED Indicator**: LED 1 shows rainbow color (cycling)
-
-**Serial Output**:
-```
-Effect: Rainbow
-Effect: Breathing
-Effect: Strobe
-Effect: Off
-```
-
----
-
-### Mode 2: BRIGHTNESS
-**Purpose**: Adjust the brightness of the hat's LEDs
-
-**Button 1 Action**: Increase brightness (16 steps)
-- Range: 1-255
-- Default: 128 (50%)
-
-**Button 2 Action**: Switch to TEMPO mode
-
-**LED Indicator**: LED 1 shows solid RED
-
-**Serial Output**:
-```
-Mode: BRIGHTNESS (adjust with Button 1)
-Brightness: 144/255
-Brightness: 160/255
-```
-
----
-
-### Mode 3: TEMPO
-**Purpose**: Adjust animation speed on the hat
-
-**Button 1 Action**: Increase tempo (×1.15 per press)
+**Tap Bottom Button**: Tempo Up
+- Increases animation speed by ×1.2x
 - Range: 0.25x to 4.0x normal speed
-- Default: 1.0x
+- Sends spell 10
 
-**Button 2 Action**: Switch back to EFFECTS mode
+### Combo Actions (Hold + Tap)
 
-**LED Indicator**: LED 1 shows solid BLUE
+**Hold Top + Tap Bottom**: Brightness Down
+- Decreases brightness by 16/255 steps
+- Range: 1-255, Default: 128 (50%)
+- Sends spell 7
 
-**Serial Output**:
-```
-Mode: TEMPO (adjust with Button 1)
-Tempo: 1.15x
-Tempo: 1.32x
-```
+**Hold Bottom + Tap Top**: Brightness Up
+- Increases brightness by 16/255 steps
+- Range: 1-255, Default: 128 (50%)
+- Sends spell 8
 
----
+**Hold Both > 0.4s**: Shoot Animation
+- Triggers one-shot "shoot" animation down the staff
+- Sends spell 12
+- Note: Animation implementation depends on receiver
 
-## Special Actions
-
-### Reset to Default
-**Action**: Hold both buttons simultaneously for 3+ seconds
-
-**Effect**:
-- Switches to EFFECTS mode
-- Sets effect to Rainbow (spell 1)
-- Resets brightness to 128/255
-- Resets tempo to 1.0x
-- Sends reset spell to hat
-
-**Serial Output**:
-```
-RESET: Effects mode, brightness 128, tempo 1.0x
-```
-
----
-
-## Auto-Timeout
-If you stay in BRIGHTNESS or TEMPO mode for **3 seconds without pressing any button**, the staff automatically returns to EFFECTS mode.
-
-**Serial Output**:
-```
-Mode timeout: Back to EFFECTS
-```
+### Disabled Actions
+**Tap Both**: No action (disabled)
+- Prevents accidental triggers
 
 ---
 
@@ -103,15 +48,16 @@ Mode timeout: Back to EFFECTS
 
 ### LED Indicators (on staff)
 - **LED 0**: Green flash = Spell transmitted (120ms pulse)
-- **LED 1**: Mode indicator
-  - Rainbow (cycling) = EFFECTS mode
-  - Red (solid) = BRIGHTNESS mode
-  - Blue (solid) = TEMPO mode
+- **Background effect**: Shows current effect
+  - Rainbow (cycling) = Rainbow effect active
+  - Breathing (pulsing) = Breathing effect active
+  - Off = No effect
 
-### Hat Response
+### Hat/Receiver Response
 - **Green flash at LED 0**: Spell received
 - **Effect change**: Smooth transition to new effect
-- **Brightness/Tempo**: Immediate adjustment to current effect
+- **Tempo change**: Immediate adjustment to animation speed
+- **Brightness change**: Immediate adjustment to LED brightness
 
 ---
 
@@ -119,35 +65,37 @@ Mode timeout: Back to EFFECTS
 
 ### Example 1: Change Effect
 ```
-1. Press Button 1 → Rainbow effect
-2. Press Button 1 → Breathing effect
-3. Press Button 1 → Strobe effect
-4. Press Button 1 → Off
-5. Press Button 1 → Back to Rainbow
+1. Tap Top Button → Rainbow effect
+2. Tap Top Button → Breathing effect
+3. Tap Top Button → Off
+4. Tap Top Button → Back to Rainbow
 ```
 
-### Example 2: Adjust Brightness
+### Example 2: Speed Up Animation
 ```
-1. Press Button 2 → Switch to BRIGHTNESS mode (LED 1 turns red)
-2. Press Button 1 → Brightness increases
-3. Press Button 1 → Brightness increases more
-4. Wait 3 seconds → Auto-return to EFFECTS mode
-```
-
-### Example 3: Speed Up Animation
-```
-1. Press Button 2 → BRIGHTNESS mode (LED 1 red)
-2. Press Button 2 → TEMPO mode (LED 1 blue)
-3. Press Button 1 → Animation speeds up
-4. Press Button 1 → Animation speeds up more
-5. Press Button 2 → Back to EFFECTS mode
+1. Tap Bottom Button → Animation speeds up (×1.2x)
+2. Tap Bottom Button → Animation speeds up more (×1.44x)
+3. Tap Bottom Button → Animation speeds up more (×1.73x)
 ```
 
-### Example 4: Full Reset
+### Example 3: Adjust Brightness Down
 ```
-1. Hold both buttons for 3+ seconds
-2. Staff resets to: Rainbow effect, brightness 128, tempo 1.0x
-3. Hat receives reset spell and displays rainbow
+1. Hold Top Button (300ms+) then tap Bottom Button → Brightness decreases by 16/255
+2. Hold Top again and tap Bottom → Brightness decreases more
+3. Hold Top again and tap Bottom → Brightness decreases more
+```
+
+### Example 4: Adjust Brightness Up
+```
+1. Hold Bottom Button (300ms+) then tap Top Button → Brightness increases by 16/255
+2. Hold Bottom again and tap Top → Brightness increases more
+3. Hold Bottom again and tap Top → Brightness increases more
+```
+
+### Example 5: Trigger Shoot Animation
+```
+1. Hold both Top and Bottom buttons for 400ms+ → Shoot animation fires
+2. Lights shoot down the staff from top to bottom
 ```
 
 ---
@@ -156,29 +104,37 @@ Mode timeout: Back to EFFECTS
 
 ### Boot Output
 ```
-=== 2-BUTTON SPELL UI ===
-Button 1 (Pad 0): Cycle Effects (Rainbow -> Breathing -> Strobe -> Off)
-Button 2 (Pad 1): Cycle Modifiers (Brightness -> Tempo -> back to Effects)
-Hold Both: Reset to Default
-Current Mode: EFFECTS
-========================
+=== SIMPLE 2-BUTTON SPELL UI ===
+Top Button: Cycle Effects (Rainbow -> Breathing -> Off)
+Bottom Button: Tempo Up
+Hold Top + Tap Bottom: Brightness Down
+Hold Bottom + Tap Top: Brightness Up
+Hold Both > 0.4s: Shoot Animation
+==================================
 ```
 
 ### Real-Time Feedback
 ```
+Pad 0 pressed at 1234567 ms
+TAP: Top Button -> Cycle Effect
 Effect: Rainbow
 Cast spell 1
-Effect: Breathing
-Cast spell 2
-Mode: BRIGHTNESS (adjust with Button 1)
-Brightness: 144/255
-Cast spell 8
-Mode: TEMPO (adjust with Button 1)
-Tempo: 1.15x
-Cast spell 6
-RESET: Effects mode, brightness 128, tempo 1.0x
-Cast spell 1
-Mode timeout: Back to EFFECTS
+
+Pad 1 pressed at 1234890 ms
+TAP: Bottom Button -> Tempo Up
+Tempo: 1.20x
+Cast spell 10
+
+Pad 0 pressed at 1235100 ms
+Pad 0 held (> 300 ms)
+Pad 1 pressed at 1235400 ms
+COMBO: Hold Top + Tap Bottom -> Brightness Down
+Brightness: 112/255
+Cast spell 7
+
+Both pads pressed together at 1235600 ms
+COMBO: Both held > 0.4s -> Shoot Animation
+Cast spell 12
 ```
 
 ---
@@ -187,12 +143,13 @@ Mode timeout: Back to EFFECTS
 
 | Spell ID | Triggered By | Effect |
 |----------|--------------|--------|
-| 1 | Button 1 in EFFECTS | Rainbow effect |
-| 2 | Button 1 in EFFECTS | Breathing effect |
-| 3 | Button 1 in EFFECTS | Strobe effect |
-| 4 | Button 1 in EFFECTS | Off |
-| 6 | Button 1 in TEMPO | Increase tempo |
-| 8 | Button 1 in BRIGHTNESS | Increase brightness |
+| 1 | Tap Top Button | Rainbow effect |
+| 2 | Tap Top Button | Breathing effect |
+| 3 | Tap Top Button | Off |
+| 7 | Hold Top + Tap Bottom | Decrease brightness (-16/255) |
+| 8 | Hold Bottom + Tap Top | Increase brightness (+16/255) |
+| 10 | Tap Bottom Button | Increase tempo (×1.2x) |
+| 12 | Hold Both > 0.4s | Shoot animation (one-shot) |
 
 ---
 
@@ -204,10 +161,11 @@ Mode timeout: Back to EFFECTS
 - Try pressing with more pressure
 - Check touch pad baseline values in serial output
 
-### Mode Not Switching
-- Verify Button 2 is being pressed (should see "Mode:" message)
-- Check that you're not holding both buttons (which triggers reset)
-- Wait for auto-timeout if stuck in a mode
+### Combos Not Triggering
+- Verify hold duration: must hold for 300ms+ to register as "hold"
+- For both-hold: must hold both pads together for 400ms+
+- Check serial output for "Pad X held" and "COMBO:" messages
+- Ensure you're not releasing the held pad before tapping the other
 
 ### Spells Not Reaching Hat
 - Verify green flash on staff LED 0 (transmission confirmation)
@@ -215,10 +173,17 @@ Mode timeout: Back to EFFECTS
 - Ensure both devices are on same ESP-NOW channel (1)
 - Verify hat is powered on and in ESP-NOW mode (not OTA window)
 
-### Brightness/Tempo Not Changing
-- Verify you're in the correct mode (red for brightness, blue for tempo)
+### Tempo Not Changing
+- Verify you're tapping the bottom button (not using combos)
 - Check that effect is active (not in Off state)
-- Verify spells 6 and 8 are being received on hat
+- Verify spell 10 is being received on hat
+- Check tempo range: 0.25x to 4.0x (may be at limits)
+
+### Brightness Not Changing
+- Verify you're using the combo controls (Hold + Tap)
+- Check that effect is active (not in Off state)
+- Verify spells 7 or 8 are being received on hat
+- Check brightness range: 1-255 (may be at limits)
 
 ---
 
@@ -227,12 +192,11 @@ Mode timeout: Back to EFFECTS
 You can also send spells via serial console (0-9):
 - `1` = Rainbow effect
 - `2` = Breathing effect
-- `3` = Strobe effect
-- `4` = Off
-- `5` = Tempo down
-- `6` = Tempo up
+- `3` = Off
 - `7` = Brightness down
 - `8` = Brightness up
+- `10` = Tempo up (type `1` then `0`)
+- `12` = Shoot animation (type `1` then `2`)
 
 Example: Type `1` in serial monitor to send rainbow effect
 
@@ -241,10 +205,24 @@ Example: Type `1` in serial monitor to send rainbow effect
 ## System Status: ✓ READY
 
 The staff is fully configured with an intuitive 2-button UI that:
-- ✓ Cycles through 4 visual effects
-- ✓ Adjusts brightness in 16-step increments
-- ✓ Adjusts animation tempo from 0.25x to 4.0x
+- ✓ Cycles through 3 visual effects (tap Top)
+- ✓ Adjusts tempo with single tap (tap Bottom)
+- ✓ Adjusts brightness via hold+tap combos
+- ✓ Triggers one-shot shoot animation (hold both)
 - ✓ Provides visual feedback via LED indicators
-- ✓ Auto-returns to effects mode after 3 seconds
-- ✓ Supports full reset with both buttons
-- ✓ Sends spells reliably to the hat via ESP-NOW
+- ✓ Supports hold/tap combo detection (300ms hold threshold)
+- ✓ Supports both-hold action (400ms threshold)
+- ✓ Sends spells reliably via ESP-NOW
+
+---
+
+## Notes on One-Shot Animations
+
+The "shoot animation" (spell 12) is designed to create a visual effect where lights appear to shoot down the staff from top to bottom. The actual animation implementation depends on the receiver (hat/cape) code. Consider implementing:
+
+- **Fast comet**: A bright pixel that travels down the LEDs quickly
+- **Color wave**: A wave of color that cascades down
+- **Sparkle trail**: Sparkles that appear sequentially from top to bottom
+- **Energy pulse**: A pulsing energy effect that moves downward
+
+The staff sends the spell command; the receiver handles the animation rendering.

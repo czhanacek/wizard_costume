@@ -24,7 +24,10 @@
 #endif
 
 // Debug Configuration
+// Set to 1 to enable strand length cycling (helps identify physical strand mapping)
+// Set to 0 for normal operation
 #define DEBUG_MODE 0
+#define DEBUG_STRAND_CYCLING 1  // Enable strand length cycling to identify physical mapping
 
 /* ESP32-CAM (AI Thinker) pin notes (summary):
 - GPIO13/14/15 are SD interface pins; can be repurposed for WS2812 if SD not used.
@@ -47,7 +50,7 @@ Electrical guidance:
 #endif
 
 #ifndef NUM_LEDS_STOLE
-#define NUM_LEDS_STOLE 250
+#define NUM_LEDS_STOLE 750
 #endif
 
 #define LED_TYPE WS2812B
@@ -133,6 +136,16 @@ unsigned long nextDebugEffectMs = 0;
 const unsigned long DEBUG_EFFECT_DURATION_MS = 1000;
 const int DEBUG_EFFECTS[] = {1, 2, 3, 0};
 const int DEBUG_EFFECTS_COUNT = sizeof(DEBUG_EFFECTS) / sizeof(DEBUG_EFFECTS[0]);
+#endif
+
+#if DEBUG_STRAND_CYCLING
+// Strand length cycling for physical mapping identification
+int strandCycleIndex = 0;
+unsigned long nextStrandCycleMs = 0;
+const unsigned long STRAND_CYCLE_DURATION_MS = 3000;  // 3 seconds per length
+const int STRAND_LENGTHS[] = {100, 200, 300, 400, 500, 600, 750};  // Different lengths to test
+const int STRAND_LENGTHS_COUNT = sizeof(STRAND_LENGTHS) / sizeof(STRAND_LENGTHS[0]);
+int currentTestLength = STRAND_LENGTHS[0];
 #endif
 
 void onRecv(const uint8_t * mac, const uint8_t *incomingData, int len) {
@@ -408,6 +421,34 @@ void loop() {
   if (otaInProgress) {
     return;
   }
+
+#if DEBUG_STRAND_CYCLING
+  // Strand length cycling mode - helps identify which physical strand is which
+  if ((long)(now - nextStrandCycleMs) >= 0) {
+    strandCycleIndex = (strandCycleIndex + 1) % STRAND_LENGTHS_COUNT;
+    currentTestLength = STRAND_LENGTHS[strandCycleIndex];
+    nextStrandCycleMs = now + STRAND_CYCLE_DURATION_MS;
+    
+    Serial.printf("STRAND CYCLING: Testing length %d LEDs (Pin A=13: RED, Pin B=14: BLUE)\n", currentTestLength);
+    
+    // Clear all LEDs first
+    FastLED.clear();
+    
+    // Light up Strand A (pin 13) in RED for the test length
+    for (int i = 0; i < currentTestLength && i < NUM_LEDS_STOLE; i++) {
+      ledsA[i] = CRGB::Red;
+    }
+    
+    // Light up Strand B (pin 14) in BLUE for the test length
+    for (int i = 0; i < currentTestLength && i < NUM_LEDS_STOLE; i++) {
+      ledsB[i] = CRGB::Blue;
+    }
+    
+    FastLED.show();
+  }
+  // Skip normal effects when strand cycling is active
+  return;
+#endif
 
 #if DEBUG_MODE
   if ((long)(now - nextDebugEffectMs) >= 0) {

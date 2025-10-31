@@ -129,7 +129,7 @@ bool debugActive = false;
 #define TOUCH_SAMPLES 64
 #endif
 #ifndef TOUCH_DELTA
-#define TOUCH_DELTA 15  // threshold delta below baseline to detect touch
+#define TOUCH_DELTA 10  // lowered threshold delta for more sensitive touch detection
 #endif
 
 // Built-in LED dim blink during OTA window (DISABLED: GPIO4 now used for touch)
@@ -205,12 +205,21 @@ struct TouchChan {
   uint16_t baseline;
   uint16_t threshold;
   bool pressed;
+  unsigned long pressStartMs;  // When this pad was first pressed
 };
 
 TouchChan touchChans[2] = {
-  {TOUCH_PIN_1, 0, 0, false},
-  {TOUCH_PIN_2, 0, 0, false},
+  {TOUCH_PIN_1, 0, 0, false, 0},
+  {TOUCH_PIN_2, 0, 0, false, 0},
 };
+
+// Combo detection state
+const unsigned long HOLD_THRESHOLD_MS = 300;  // 0.3s to register as "hold"
+const unsigned long BOTH_HOLD_THRESHOLD_MS = 400;  // 0.4s for both-hold action
+bool pad0_held = false;  // True if pad 0 is held (not tapped)
+bool pad1_held = false;  // True if pad 1 is held (not tapped)
+unsigned long bothPressStartMs = 0;  // When both pads were pressed together
+bool bothPressedTogether = false;  // True if both pressed simultaneously
 
 static uint16_t sampleTouch(int pin, int samples) {
   uint32_t acc = 0;
@@ -426,9 +435,11 @@ void setup() {
   // Start with visible background
   currentEffect = 1;
   Serial.println("\n=== SIMPLE 2-BUTTON SPELL UI ===");
-  Serial.println("Button 1 (Pad 0): Cycle Effects (Rainbow -> Breathing -> Off)");
-  Serial.println("Button 2 (Pad 1): Brightness Up");
-  Serial.println("Both Buttons: Brightness Down");
+  Serial.println("Top Button: Cycle Effects (Rainbow -> Breathing -> Off)");
+  Serial.println("Bottom Button: Tempo Up");
+  Serial.println("Hold Top + Tap Bottom: Brightness Down");
+  Serial.println("Hold Bottom + Tap Top: Brightness Up");
+  Serial.println("Hold Both > 0.4s: Shoot Animation");
   Serial.println("==================================\n");
 }
 
@@ -524,7 +535,9 @@ void loop() {
     }
   }
 
-  // Touch handling (2-pin layout)
+  // Touch handling (2-pin layout) with combo detection
+  unsigned long now = millis();
+  
   // Read both pads first
   uint16_t val0 = touchRead(touchChans[0].pin);
   uint16_t val1 = touchRead(touchChans[1].pin);
@@ -535,23 +548,85 @@ void loop() {
   bool isPressed0 = (drop0 >= TOUCH_DELTA);
   bool isPressed1 = (drop1 >= TOUCH_DELTA);
   
-  // Check if both pressed simultaneously
-  bool bothPressed = isPressed0 && isPressed1;
   bool wasPressed0 = touchChans[0].pressed;
   bool wasPressed1 = touchChans[1].pressed;
+  bool bothPressed = isPressed0 && isPressed1;
+  bool wasBothPressed = wasPressed0 && wasPressed1;
   
-  if (bothPressed && !(wasPressed0 && wasPressed1)) {
-    // Both just pressed together: Brightness down
+  // ===== PRESS/RELEASE TRANSITIONS =====
+  
+  // Pad 0 press (rising edge)
+  if (isPressed0 && !wasPressed0) {
+    touchChans[0].pressStartMs = now;
+    pad0_held = false;
+    Serial.printf("Pad 0 pressed at %lu ms\n", now);
+  }
+  
+  // Pad 1 press (rising edge)
+  if (isPressed1 && !wasPressed1) {
+    touchChans[1].pressStartMs = now;
+    pad1_held = false;
+    Serial.printf("Pad 1 pressed at %lu ms\n", now);
+  }
+  
+  // Both pressed together (rising edge)
+  if (bothPressed && !wasBothPressed) {
+    bothPressStartMs = now;
+    bothPressedTogether = true;
+    Serial.printf("Both pads pressed together at %lu ms\n", now);
+  }
+  
+  // ===== HOLD DETECTION (while pressed) =====
+  
+  // Pad 0 hold detection
+  if (isPressed0 && !pad0_held && (now - touchChans[0].pressStartMs) >= HOLD_THRESHOLD_MS) {
+    pad0_held = true;
+    Serial.printf("Pad 0 held (> %lu ms)\n", HOLD_THRESHOLD_MS);
+  }
+  
+  // Pad 1 hold detection
+  if (isPressed1 && !pad1_held && (now - touchChans[1].pressStartMs) >= HOLD_THRESHOLD_MS) {
+    pad1_held = true;
+    Serial.printf("Pad 1 held (> %lu ms)\n", HOLD_THRESHOLD_MS);
+  }
+  
+  // ===== COMBO ACTIONS =====
+  
+  // Hold Pad 0 + Tap Pad 1 (Pad 1 release while Pad 0 still held)
+  if (!isPressed1 && wasPressed1 && isPressed0 && pad0_held && !pad1_held) {
+    Serial.println("COMBO: Hold Top + Tap Bottom -> Brightness Down");
     uint16_t b = globalBrightness;
     if (b > BRIGHTNESS_STEP) b -= BRIGHTNESS_STEP; else b = 1;
     globalBrightness = (uint8_t)b;
     FastLED.setBrightness(globalBrightness);
-    sendSpell(7);
-    Serial.printf("Brightness Down: %u/255\n", globalBrightness);
-  } else if (!bothPressed) {
-    // Handle individual presses only when not both pressed
-    if (isPressed0 && !wasPressed0) {
-      // Pad 0 rising edge: Cycle effect
+    sendSpell(7);  // Brightness down
+    Serial.printf("Brightness: %u/255\n", globalBrightness);
+  }
+  
+  // Hold Pad 1 + Tap Pad 0 (Pad 0 release while Pad 1 still held)
+  if (!isPressed0 && wasPressed0 && isPressed1 && pad1_held && !pad0_held) {
+    Serial.println("COMBO: Hold Bottom + Tap Top -> Brightness Up");
+    uint16_t b = globalBrightness;
+    b = (b + BRIGHTNESS_STEP > 255) ? 255 : (b + BRIGHTNESS_STEP);
+    globalBrightness = (uint8_t)b;
+    FastLED.setBrightness(globalBrightness);
+    sendSpell(8);  // Brightness up
+    Serial.printf("Brightness: %u/255\n", globalBrightness);
+  }
+  
+  // Both held > 0.4s (while both still pressed)
+  if (bothPressed && bothPressedTogether && (now - bothPressStartMs) >= BOTH_HOLD_THRESHOLD_MS) {
+    Serial.println("COMBO: Both held > 0.4s -> Shoot Animation");
+    sendSpell(12);  // One-shot shoot animation
+    bothPressedTogether = false;  // Prevent repeated triggers
+  }
+  
+  // ===== SINGLE TAP ACTIONS (only if not part of a combo) =====
+  
+  if (!bothPressed) {
+    // Pad 0 tap (release while not held, and pad 1 not pressed)
+    if (!isPressed0 && wasPressed0 && !pad0_held && !isPressed1) {
+      Serial.println("TAP: Top Button -> Cycle Effect");
       currentEffect++;
       if (currentEffect > 3) currentEffect = 1;
       sendSpell(currentEffect);
@@ -559,17 +634,40 @@ void loop() {
       Serial.printf("Effect: %s\n", effectNames[currentEffect]);
     }
     
-    if (isPressed1 && !wasPressed1) {
-      // Pad 1 rising edge: Brightness up
-      uint16_t b = globalBrightness;
-      b = (b + BRIGHTNESS_STEP > 255) ? 255 : (b + BRIGHTNESS_STEP);
-      globalBrightness = (uint8_t)b;
-      FastLED.setBrightness(globalBrightness);
-      sendSpell(8);
-      Serial.printf("Brightness Up: %u/255\n", globalBrightness);
+    // Pad 1 tap (release while not held, and pad 0 not pressed)
+    if (!isPressed1 && wasPressed1 && !pad1_held && !isPressed0) {
+      Serial.println("TAP: Bottom Button -> Toggle Tempo");
+      static bool tempoFast = false;
+      if (tempoFast) {
+        tempoFactor = 1.0f;  // normal speed
+      } else {
+        tempoFactor = 2.0f;  // fast mode
+      }
+      tempoFast = !tempoFast;
+      sendSpell(10);  // Tempo toggle
+      Serial.printf("Tempo toggled: %.2fx\n", tempoFactor);
     }
   }
   
+  // ===== RELEASE TRANSITIONS =====
+  
+  // Pad 0 release (falling edge)
+  if (!isPressed0 && wasPressed0) {
+    Serial.printf("Pad 0 released (held: %s)\n", pad0_held ? "yes" : "no");
+  }
+  
+  // Pad 1 release (falling edge)
+  if (!isPressed1 && wasPressed1) {
+    Serial.printf("Pad 1 released (held: %s)\n", pad1_held ? "yes" : "no");
+  }
+  
+  // Both released (falling edge)
+  if (!bothPressed && wasBothPressed) {
+    bothPressedTogether = false;
+    Serial.println("Both pads released");
+  }
+  
+  // Update state
   touchChans[0].pressed = isPressed0;
   touchChans[1].pressed = isPressed1;
 
@@ -620,8 +718,7 @@ void loop() {
     }
   }
 
-  // Render background effect
-  unsigned long now = millis();
+  // Render background effect (reuse 'now' from touch handling above)
 
   switch (backgroundEffect) {
     case 0: {

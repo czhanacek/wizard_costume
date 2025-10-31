@@ -125,13 +125,13 @@ Electrical guidance:
 // GPIO12 is a boot strap pin but safe for LED data after boot
 // Alternative: GPIO16 if GPIO12 causes issues
 #ifndef LED_PIN_STOLE
-#define LED_PIN_STOLE 12   // GPIO12 - Hat LEDs (250 LEDs)
+#define LED_PIN_STOLE 12   // GPIO12 - Hat LEDs (900 LEDs - 3.6x original)
 #endif
 #ifndef NUM_LEDS_STOLE
-#define NUM_LEDS_STOLE 250
+#define NUM_LEDS_STOLE 250  // Match staff LED count for stole/hat port
 #endif
 
-#define NUM_LEDS 50       // LEDs per strip
+#define NUM_LEDS 250       // LEDs per strip
 #define LED_TYPE WS2812B  // LED strip type (WS2812B)
 #define COLOR_ORDER GRB   // Color order for WS2812B strips (typically GRB)
 // Dynamic ESP-NOW channel (defaults to 1, updated to AP channel if connected during OTA)
@@ -281,6 +281,8 @@ void setup() {
 #endif
   // Built-in LED (GPIO4) not used - hat LEDs on GPIO12 instead
   builtinLedReady = false;
+
+  // Removed strand diagnostic mode prior to OTA initialization
 
   // Initialize FastLED for 4 strips + stole
   FastLED.addLeds<LED_TYPE, LED_PIN_1, COLOR_ORDER>(leds1, NUM_LEDS);
